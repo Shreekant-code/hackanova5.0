@@ -17,6 +17,18 @@ const profileSchema = new mongoose.Schema({
     type: String,
     required: true
   },
+  category:{
+    type:String,
+    required:true
+  },
+  annual_income: {
+    type: Number,
+    default: null
+  },
+  gender: {
+    type: String,
+    default: ""
+  },
 
   location: {
     city: String,

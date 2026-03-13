@@ -11,10 +11,10 @@ export const createProfile = async (req, res) => {
       });
     }
 
-    const { age, occupation, location, phone } = req.body;
+    const { age, occupation, category, annual_income, gender, location, phone } = req.body;
 
     // Optional: check required fields
-    if (!age || !occupation || !location || !phone) {
+    if (!age || !occupation || !category || !location || !phone) {
       return res.status(400).json({
         success: false,
         message: "All fields are required",
@@ -35,6 +35,9 @@ export const createProfile = async (req, res) => {
       user: req.user.id,
       age,
       occupation,
+      category,
+      annual_income,
+      gender,
       location,
       phone,
     });

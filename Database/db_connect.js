@@ -2,7 +2,9 @@ import mongoose from "mongoose";
 
 const connect_DB = async () => {
   try {
-    await mongoose.connect("mongodb://localhost:27017/Hacknova5");
+    const mongoUri = process.env.MONGODB_URI || "mongodb://localhost:27017";
+    const appDbName = process.env.APP_DB_NAME || "Hacknova5";
+    await mongoose.connect(mongoUri, { dbName: appDbName });
 
     console.log("MongoDB Connected");
   } catch (error) {
