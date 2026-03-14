@@ -51,6 +51,10 @@ const buildAutofillData = ({ userProfile = {}, documents = [] }) => {
   documents.forEach((doc) => {
     const extracted = doc?.extracted_data || {};
     const autofill = doc?.autofill_fields || {};
+    const dynamicAutofill =
+      doc?.dynamic_schema?.autofill_payload && typeof doc.dynamic_schema.autofill_payload === "object"
+        ? doc.dynamic_schema.autofill_payload
+        : {};
 
     Object.entries(extracted).forEach(([key, value]) => {
       if (merged[key] === null || merged[key] === undefined || merged[key] === "") {
@@ -59,6 +63,12 @@ const buildAutofillData = ({ userProfile = {}, documents = [] }) => {
     });
 
     Object.entries(autofill).forEach(([key, value]) => {
+      if (merged[key] === null || merged[key] === undefined || merged[key] === "") {
+        merged[key] = value;
+      }
+    });
+
+    Object.entries(dynamicAutofill).forEach(([key, value]) => {
       if (merged[key] === null || merged[key] === undefined || merged[key] === "") {
         merged[key] = value;
       }
@@ -166,6 +176,7 @@ const SchemesPage = () => {
         cloudinary_url: doc.cloudinary_url,
         extracted_data: doc.extracted_data || {},
         autofill_fields: doc.autofill_fields || {},
+        dynamic_schema: doc.dynamic_schema || {},
       }));
       const autofillData = buildAutofillData({
         userProfile,

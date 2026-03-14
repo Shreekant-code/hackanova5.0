@@ -6,6 +6,9 @@ const MAX_MULTI_STEP = 3;
 const MAX_SCROLL_PASSES = 8;
 const LOCAL_STORAGE_CONTEXT_KEY = "gov_platform_extension_payload";
 const FIELD_MATCH_MIN_SCORE = 6;
+const MISSING_DATA_WARNING_TEXT = "THIS DATA IS MISSING THEN U HAVE NOT PROPER UPLOADED DOCUMENT";
+const FIELD_SUGGESTION_ATTR = "data-gov-assist-suggestion-token";
+const FIELD_SUGGESTION_NODE_ATTR = "data-gov-assist-suggestion-for";
 
 const FIELD_KEYWORDS = {
   name: ["full name", "applicant name", "candidate name", "beneficiary name", "subscriber name", "name"],
@@ -37,7 +40,15 @@ const FIELD_KEYWORDS = {
   north_eastern_region: ["north eastern region", "north east region", "belong to north eastern region"],
   income_tax_payer: ["income tax payer", "income taxpayer", "tax payer", "taxpayer"],
   nps_member: ["member beneficiary of nps esic epfo", "nps", "esic", "epfo", "nps esic epfo"],
-  consent_authentication: ["consent for authentication", "authentication consent", "i hereby give my consent"],
+  consent_authentication: [
+    "consent for authentication",
+    "authentication consent",
+    "i hereby give my consent",
+    "i agree",
+    "agree",
+    "authorize",
+    "authorise",
+  ],
   verification_type: ["verification type", "aadhaar vid", "aadhaar/vid"],
 };
 
@@ -93,10 +104,76 @@ const KEY_ALIASES = {
   north_east_region: "north_eastern_region",
   tax_payer: "income_tax_payer",
   consent: "consent_authentication",
+  authentication_consent: "consent_authentication",
+  consent_authentication: "consent_authentication",
   ifsc: "ifsc_code",
   institution: "institution_name",
   college_name: "institution_name",
   year: "year_of_passing",
+};
+
+const STRICT_SENSITIVE_KEYS = new Set([
+  "date_of_birth",
+  "aadhaar_number",
+  "eshram_uan",
+  "vid_number",
+  "pan_number",
+  "bank_account",
+  "ifsc_code",
+  "email",
+  "phone",
+  "pincode",
+  "verification_type",
+]);
+
+const STRICT_INTENT_HINTS = {
+  date_of_birth: ["date of birth", "dob", "birth date"],
+  aadhaar_number: ["aadhaar", "aadhar", "uid"],
+  eshram_uan: ["e shram", "eshram", "uan"],
+  vid_number: ["vid", "virtual id"],
+  pan_number: ["pan", "permanent account number"],
+  bank_account: ["bank account", "account number"],
+  ifsc_code: ["ifsc"],
+  email: ["email", "e-mail", "mail id"],
+  phone: ["mobile", "phone", "contact number"],
+  pincode: ["pin code", "pincode", "postal code", "zip code"],
+  consent_authentication: ["consent", "i agree", "authentication", "authorize", "authorise"],
+  verification_type: ["verification type", "aadhaar", "vid", "virtual id"],
+};
+
+const CONSENT_INTENT_TOKENS = [
+  "i agree",
+  "agree",
+  "consent",
+  "hereby give my consent",
+  "authorize",
+  "authorise",
+  "authentication",
+  "validate my aadhaar",
+  "validate aadhaar",
+  "declaration",
+  "undertaking",
+  "terms and conditions",
+  "terms & conditions",
+];
+
+const MASKED_SENSITIVE_KEYS = new Set([
+  "aadhaar_number",
+  "eshram_uan",
+  "vid_number",
+  "pan_number",
+  "bank_account",
+  "ifsc_code",
+]);
+
+const FIELD_TYPE_REASONING_KEYS = {
+  email: ["email"],
+  tel: ["phone"],
+  date: ["date_of_birth"],
+  checkbox: ["consent_authentication", "income_tax_payer", "nps_member", "north_eastern_region"],
+  radio: ["gender", "verification_type", "consent_authentication", "income_tax_payer", "nps_member"],
+  select: ["gender", "category", "state", "district", "city", "occupation", "verification_type"],
+  password: ["password", "confirm_password", "aadhaar_number", "pan_number", "vid_number", "eshram_uan"],
 };
 
 const normalizeKeyName = (value) =>
@@ -127,6 +204,7 @@ const AUTH_KEYWORDS = ["login", "log in", "password", "sign in", "username", "ot
 const CAPTCHA_KEYWORDS = ["captcha", "recaptcha", "hcaptcha", "i am not a robot"];
 
 let autofillRunning = false;
+let suggestionCounter = 0;
 
 const normalize = (value) =>
   String(value || "")
@@ -155,6 +233,223 @@ const canonicalizeKey = (value) => {
 const toText = (value) => {
   if (value === null || value === undefined) return "";
   return String(value).trim();
+};
+
+const digitsOnly = (value) => String(value || "").replace(/\D+/g, "");
+
+const isLikelyDate = (value) => {
+  const text = toText(value);
+  if (!text) return false;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return true;
+  if (/^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$/.test(text)) return true;
+  const parsed = new Date(text);
+  return !Number.isNaN(parsed.getTime());
+};
+
+const isLikelyEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(toText(value));
+
+const getFieldDescriptorText = (field = {}) =>
+  `${field?.label || ""} ${field?.placeholder || ""} ${field?.name || ""} ${field?.id || ""} ${field?.descriptor || ""}`;
+
+const scoreIntentHintHits = (descriptorText = "", key = "") => {
+  const descriptor = normalize(descriptorText);
+  const canonicalKey = canonicalizeKey(key) || key;
+  const tokens = STRICT_INTENT_HINTS[canonicalKey] || [];
+  if (!descriptor || tokens.length === 0) return 0;
+  return tokens.filter((token) => descriptor.includes(normalize(token))).length;
+};
+
+const detectStrongDescriptorIntent = (descriptorText = "") => {
+  const descriptor = normalize(descriptorText);
+  if (!descriptor) return "";
+
+  let bestKey = "";
+  let bestHits = 0;
+  Object.entries(STRICT_INTENT_HINTS).forEach(([key, tokens]) => {
+    const hits = (tokens || []).filter((token) => descriptor.includes(normalize(token))).length;
+    if (hits > bestHits) {
+      bestHits = hits;
+      bestKey = key;
+    }
+  });
+  return bestHits > 0 ? bestKey : "";
+};
+
+const hasConsentIntent = (descriptorText = "") => {
+  const descriptor = normalize(descriptorText);
+  if (!descriptor) return false;
+  return CONSENT_INTENT_TOKENS.some((token) => descriptor.includes(normalize(token)));
+};
+
+const isMaskedSensitiveFieldForKey = (field = {}, key = "") => {
+  const canonicalKey = canonicalizeKey(key) || key;
+  if (!MASKED_SENSITIVE_KEYS.has(canonicalKey)) return false;
+  return scoreIntentHintHits(getFieldDescriptorText(field), canonicalKey) > 0;
+};
+
+const isFieldTypeCompatibleWithKey = (field = {}, key = "") => {
+  const canonicalKey = canonicalizeKey(key) || key;
+  const type = normalize(field?.type || field?.tag || "text");
+  if (!canonicalKey) return false;
+  if (!type) return true;
+
+  if (type === "email") return canonicalKey === "email";
+  if (type === "tel") return canonicalKey === "phone";
+  if (type === "password") {
+    return ["password", "confirm_password"].includes(canonicalKey) || isMaskedSensitiveFieldForKey(field, canonicalKey);
+  }
+  if (type === "date") return canonicalKey === "date_of_birth";
+
+  if (canonicalKey === "email") return ["email", "text", "textarea"].includes(type);
+  if (canonicalKey === "phone") return ["tel", "text", "number"].includes(type);
+  if (canonicalKey === "date_of_birth") return ["date", "text"].includes(type);
+  if (canonicalKey === "consent_authentication") return ["checkbox", "radio"].includes(type);
+  if (canonicalKey === "verification_type") return ["radio", "checkbox", "select"].includes(type);
+  if (
+    [
+      "aadhaar_number",
+      "eshram_uan",
+      "vid_number",
+      "pan_number",
+      "bank_account",
+      "ifsc_code",
+      "pincode",
+    ].includes(canonicalKey)
+  ) {
+    return !["email", "date", "password", "checkbox", "radio", "file"].includes(type);
+  }
+  return true;
+};
+
+const isValueCompatibleWithKey = (key = "", value = "") => {
+  const canonicalKey = canonicalizeKey(key) || key;
+  const text = toText(value);
+  if (!canonicalKey || !text) return false;
+
+  if (canonicalKey === "date_of_birth") return isLikelyDate(text);
+  if (canonicalKey === "aadhaar_number") return digitsOnly(text).length === 12;
+  if (canonicalKey === "eshram_uan") return digitsOnly(text).length >= 12;
+  if (canonicalKey === "vid_number") return digitsOnly(text).length >= 16;
+  if (canonicalKey === "pan_number") return /^[A-Z]{5}[0-9]{4}[A-Z]$/i.test(text);
+  if (canonicalKey === "phone") {
+    const digits = digitsOnly(text);
+    return digits.length >= 10 && digits.length <= 13;
+  }
+  if (canonicalKey === "pincode") return digitsOnly(text).length === 6;
+  if (canonicalKey === "email") return isLikelyEmail(text);
+  if (canonicalKey === "ifsc_code") return /^[A-Z]{4}0[A-Z0-9]{6}$/i.test(text);
+  if (canonicalKey === "bank_account") {
+    const digits = digitsOnly(text);
+    return digits.length >= 8 && digits.length <= 20;
+  }
+  if (canonicalKey === "verification_type") {
+    return ["aadhaar", "aadhar", "vid", "virtual id"].includes(normalize(text));
+  }
+  if (canonicalKey === "consent_authentication") {
+    return ["yes", "no", "true", "false", "1", "0", "agree", "accepted", "decline"].includes(
+      normalize(text)
+    );
+  }
+  return true;
+};
+
+const hasStrictDescriptorConflict = (descriptorText = "", key = "") => {
+  const canonicalKey = canonicalizeKey(key) || key;
+  if (!STRICT_SENSITIVE_KEYS.has(canonicalKey)) return false;
+  const descriptorIntent = detectStrongDescriptorIntent(descriptorText);
+  if (!descriptorIntent || descriptorIntent === canonicalKey) return false;
+  if (!STRICT_SENSITIVE_KEYS.has(descriptorIntent)) return false;
+  const currentHits = scoreIntentHintHits(descriptorText, canonicalKey);
+  const competingHits = scoreIntentHintHits(descriptorText, descriptorIntent);
+  return competingHits >= Math.max(currentHits, 1);
+};
+
+const getResolvedFieldIntentKey = (field = {}) => {
+  const type = normalize(field?.type || field?.tag || "");
+  if (type === "email") return "email";
+  if (type === "tel") return "phone";
+  if (type === "checkbox" && hasConsentIntent(getFieldDescriptorText(field))) {
+    return "consent_authentication";
+  }
+
+  const detected = detectFieldKey(field);
+  if (detected) return canonicalizeKey(detected) || detected;
+
+  if (type === "password") return "password";
+
+  if (type === "select") {
+    const dropdown = inferDropdownKeyFromOptions(field);
+    if (dropdown) return canonicalizeKey(dropdown) || dropdown;
+  }
+  return "";
+};
+
+const hasStrongIntentMismatch = (field = {}, key = "") => {
+  const canonicalKey = canonicalizeKey(key) || key;
+  const intentKey = getResolvedFieldIntentKey(field);
+  if (!canonicalKey || !intentKey || canonicalKey === intentKey) return false;
+
+  const descriptor = normalizeKeyName(getFieldDescriptorText(field));
+  if (!descriptor) return false;
+  const mappedScore = scoreDescriptorForKey(descriptor, canonicalKey);
+  const intentScore = scoreDescriptorForKey(descriptor, intentKey);
+  return intentScore >= FIELD_MATCH_MIN_SCORE && intentScore >= mappedScore + 2;
+};
+
+const validateResolvedCandidate = ({ field, key, value }) => {
+  const canonicalKey = canonicalizeKey(key) || key;
+  const descriptorText = getFieldDescriptorText(field);
+  if (!canonicalKey) {
+    return {
+      ok: false,
+      reason: "No reliable source key mapped for this field.",
+    };
+  }
+  if (!toText(value)) {
+    return {
+      ok: false,
+      reason: `${MISSING_DATA_WARNING_TEXT}: ${canonicalKey}`,
+      missingData: true,
+    };
+  }
+  if (!isFieldTypeCompatibleWithKey(field, canonicalKey)) {
+    return {
+      ok: false,
+      reason: `Field type mismatch for "${canonicalKey}".`,
+    };
+  }
+  if (!isValueCompatibleWithKey(canonicalKey, value)) {
+    return {
+      ok: false,
+      reason: `Value format mismatch for "${canonicalKey}".`,
+    };
+  }
+  if (hasStrictDescriptorConflict(descriptorText, canonicalKey)) {
+    return {
+      ok: false,
+      reason: `Descriptor intent conflicts with "${canonicalKey}".`,
+    };
+  }
+  if (hasStrongIntentMismatch(field, canonicalKey)) {
+    const intentKey = getResolvedFieldIntentKey(field);
+    return {
+      ok: false,
+      reason: `Field intent indicates "${intentKey}" but mapping resolved "${canonicalKey}".`,
+    };
+  }
+  if (
+    STRICT_SENSITIVE_KEYS.has(canonicalKey) &&
+    scoreDescriptorForKey(normalizeKeyName(descriptorText), canonicalKey) < FIELD_MATCH_MIN_SCORE
+  ) {
+    return {
+      ok: false,
+      reason: `Descriptor confidence too low for sensitive field "${canonicalKey}".`,
+    };
+  }
+  return {
+    ok: true,
+    canonical_key: canonicalKey,
+  };
 };
 
 const sanitizeHintText = (value) =>
@@ -428,6 +723,10 @@ const detectFieldKey = (field) => {
   );
   if (!descriptor) return "";
 
+  if (field?.type === "checkbox" && hasConsentIntent(descriptor)) {
+    return "consent_authentication";
+  }
+
   if (
     field?.type === "radio" &&
     (descriptor.includes("verification type") || (descriptor.includes("aadhaar") && descriptor.includes("vid")))
@@ -534,10 +833,9 @@ const getDatasetValue = (dataset = {}, preferredKey = "", descriptorText = "") =
       if (datasetKeyText.includes(token) || token.includes(datasetKeyText)) score += 6;
       token
         .split(" ")
-        .filter(Boolean)
+        .filter((word) => Boolean(word) && word.length > 2)
         .forEach((word) => {
-          if (datasetKeyText.includes(word)) score += 1;
-          if (descriptor.includes(word)) score += 1;
+          if (datasetKeyText.includes(word) && descriptor.includes(word)) score += 2;
         });
     });
 
@@ -550,7 +848,7 @@ const getDatasetValue = (dataset = {}, preferredKey = "", descriptorText = "") =
     }
   }
 
-  if (best.score >= 4) {
+  if (best.score >= 5) {
     return {
       key: best.key,
       value: best.value,
@@ -685,52 +983,159 @@ const scoreDescriptorForKey = (descriptor = "", rawKey = "") => {
   return score;
 };
 
-const resolveDatasetEntryForField = (field, dataset = {}, preferredCandidates = []) => {
-  const descriptorText = `${field.label || ""} ${field.placeholder || ""} ${field.name || ""} ${field.id || ""} ${field.descriptor || ""}`;
+const buildReasonedCandidateRanking = (field = {}, dataset = {}, preferredCandidates = []) => {
+  const descriptorText = getFieldDescriptorText(field);
   const descriptor = normalizeKeyName(descriptorText);
-  const candidates = Array.from(
-    new Set((preferredCandidates || []).map((item) => canonicalizeKey(item) || toText(item)).filter(Boolean))
-  );
+  const fieldType = normalize(field?.type || field?.tag || "");
+  const rank = new Map();
 
-  for (const candidate of candidates) {
-    const resolved = getDatasetValue(dataset, candidate, descriptorText);
-    if (toText(resolved?.value)) {
-      return {
-        key: toText(resolved?.key || candidate),
-        value: toText(resolved?.value),
-        strategy: "candidate_alias",
-        reason: `Matched using label/placeholder alias candidate "${toText(candidate)}".`,
-      };
+  const add = (rawKey, score = 0, reason = "") => {
+    const canonical = canonicalizeKey(rawKey) || toText(rawKey);
+    if (!canonical || score <= 0) return;
+    const current = rank.get(canonical);
+    if (!current) {
+      rank.set(canonical, {
+        score,
+        reasons: reason ? [reason] : [],
+      });
+      return;
     }
-  }
+    if (score > current.score) current.score = score;
+    if (reason && !current.reasons.includes(reason)) current.reasons.push(reason);
+  };
 
-  let best = { score: 0, key: "", value: "" };
+  (preferredCandidates || []).forEach((candidate) => add(candidate, 30, "candidate hint"));
+
+  const intentKey = getResolvedFieldIntentKey(field);
+  if (intentKey) add(intentKey, 34, "field intent");
+
+  const detectedKey = detectFieldKey(field);
+  if (detectedKey) add(detectedKey, 28, "label/placeholder detection");
+
+  const dropdownKey = inferDropdownKeyFromOptions(field);
+  if (dropdownKey) add(dropdownKey, 24, "dropdown option inference");
+
+  const datasetMatched = detectFieldKeyFromDataset(field, dataset);
+  if (datasetMatched) add(datasetMatched, 22, "dataset key overlap");
+
+  (FIELD_TYPE_REASONING_KEYS[fieldType] || []).forEach((key, index) => {
+    add(key, Math.max(10 - index, 6), "field type prior");
+  });
+
   Object.entries(dataset || {}).forEach(([datasetKey, rawValue]) => {
     const value = toText(rawValue);
     if (!value) return;
-    const score = scoreDescriptorForKey(descriptor, datasetKey);
-    if (score > best.score) {
+    const canonicalDatasetKey = canonicalizeKey(datasetKey) || datasetKey;
+    const descriptorScore = scoreDescriptorForKey(descriptor, canonicalDatasetKey);
+    const intentScore = scoreIntentHintHits(descriptorText, canonicalDatasetKey) * 4;
+    const total = descriptorScore + intentScore;
+    if (total >= 5) {
+      add(canonicalDatasetKey, Math.min(total, 26), "descriptor fuzzy score");
+    }
+  });
+
+  if (fieldType === "checkbox" && hasConsentIntent(descriptorText)) {
+    add("consent_authentication", 40, "consent checkbox intent");
+  }
+
+  return Array.from(rank.entries())
+    .sort((a, b) => b[1].score - a[1].score)
+    .map(([key, meta]) => ({
+      key,
+      score: Number(meta?.score || 0),
+      reasons: Array.isArray(meta?.reasons) ? meta.reasons : [],
+    }));
+};
+
+const isResolvedKeyAlignedToFieldIntent = (field = {}, resolvedKey = "") => {
+  const canonicalResolved = canonicalizeKey(resolvedKey) || resolvedKey;
+  const intentKey = getResolvedFieldIntentKey(field);
+  if (!canonicalResolved || !intentKey || canonicalResolved === intentKey) return true;
+
+  const descriptor = normalizeKeyName(getFieldDescriptorText(field));
+  if (!descriptor) return true;
+  const resolvedScore = scoreDescriptorForKey(descriptor, canonicalResolved);
+  const intentScore = scoreDescriptorForKey(descriptor, intentKey);
+  return !(intentScore >= FIELD_MATCH_MIN_SCORE && intentScore >= resolvedScore + 2);
+};
+
+const resolveDatasetEntryForField = (field, dataset = {}, preferredCandidates = []) => {
+  const descriptorText = `${field.label || ""} ${field.placeholder || ""} ${field.name || ""} ${field.id || ""} ${field.descriptor || ""}`;
+  const descriptor = normalizeKeyName(descriptorText);
+  const ranking = buildReasonedCandidateRanking(field, dataset, preferredCandidates);
+
+  let best = {
+    score: 0,
+    key: "",
+    value: "",
+    strategy: "",
+    reason: "",
+  };
+
+  ranking.forEach((candidate) => {
+    const candidateKey = toText(candidate?.key);
+    if (!candidateKey) return;
+    const resolved = getDatasetValue(dataset, candidateKey, descriptorText);
+    const value = toText(resolved?.value);
+    if (!value) return;
+
+    const resolvedKey = canonicalizeKey(toText(resolved?.key || candidateKey)) || toText(resolved?.key || candidateKey);
+    if (!resolvedKey) return;
+    if (!isResolvedKeyAlignedToFieldIntent(field, resolvedKey)) return;
+    if (!isFieldTypeCompatibleWithKey(field, resolvedKey)) return;
+    if (hasStrictDescriptorConflict(descriptorText, resolvedKey)) return;
+
+    const descriptorScore = scoreDescriptorForKey(descriptor, resolvedKey);
+    const intentScore = scoreIntentHintHits(descriptorText, resolvedKey) * 4;
+    const valueScore = isValueCompatibleWithKey(resolvedKey, value) ? 3 : 0;
+    const sameKeyScore = resolvedKey === candidateKey ? 2 : 0;
+    const totalScore = Number(candidate?.score || 0) + descriptorScore + intentScore + valueScore + sameKeyScore;
+
+    if (totalScore > best.score) {
       best = {
+        score: totalScore,
+        key: resolvedKey,
+        value,
+        strategy: "reasoned_alias",
+        reason: `Matched by AI reasoning (${[...(candidate?.reasons || []), `score ${totalScore}`].join(", ")}).`,
+      };
+    }
+  });
+
+  if (best.key && best.value && best.score >= 9) return best;
+
+  let descriptorBest = { score: 0, key: "", value: "" };
+  Object.entries(dataset || {}).forEach(([datasetKey, rawValue]) => {
+    const value = toText(rawValue);
+    if (!value) return;
+    const canonicalKey = canonicalizeKey(datasetKey) || datasetKey;
+    if (!isResolvedKeyAlignedToFieldIntent(field, canonicalKey)) return;
+    if (!isFieldTypeCompatibleWithKey(field, canonicalKey)) return;
+    const score = scoreDescriptorForKey(descriptor, canonicalKey);
+    if (score > descriptorBest.score) {
+      descriptorBest = {
         score,
-        key: datasetKey,
+        key: canonicalKey,
         value,
       };
     }
   });
 
-  return best.score >= 6
-    ? {
-        key: best.key,
-        value: best.value,
-        strategy: "descriptor_fuzzy",
-        reason: `Matched by descriptor fuzzy comparison (score ${best.score}).`,
-      }
-    : {
-        key: "",
-        value: "",
-        strategy: "",
-        reason: "",
-      };
+  if (descriptorBest.score >= 7) {
+    return {
+      key: descriptorBest.key,
+      value: descriptorBest.value,
+      strategy: "descriptor_fuzzy",
+      reason: `Matched by descriptor fuzzy comparison (score ${descriptorBest.score}).`,
+    };
+  }
+
+  return {
+    key: "",
+    value: "",
+    strategy: "",
+    reason: "",
+  };
 };
 
 const SENSITIVE_MATCH_KEY_PATTERN =
@@ -763,6 +1168,120 @@ const pushMatchingInsight = (bucket, insight = {}) => {
     field,
     source_key: sourceKey,
     value_preview: toText(insight?.value_preview),
+    reason,
+  });
+};
+
+const getFieldSuggestionToken = (element) => {
+  if (!element) return "";
+  const existing = toText(element.getAttribute(FIELD_SUGGESTION_ATTR));
+  if (existing) return existing;
+  suggestionCounter += 1;
+  const token = `gov_assist_suggestion_${suggestionCounter}`;
+  element.setAttribute(FIELD_SUGGESTION_ATTR, token);
+  return token;
+};
+
+const getFieldSuggestionHost = (element) => {
+  if (!element) return null;
+  return (
+    element.closest(
+      ".form-group, .form-field, .field, .input-group, .mat-form-field, .ant-form-item, .control, td, th, li, div, label"
+    ) || element.parentElement
+  );
+};
+
+const clearFieldSuggestion = (element) => {
+  if (!element) return;
+  const token = toText(element.getAttribute(FIELD_SUGGESTION_ATTR));
+  if (!token) return;
+  const host = getFieldSuggestionHost(element);
+  const node = host?.querySelector?.(`[${FIELD_SUGGESTION_NODE_ATTR}="${cssEscape(token)}"]`);
+  if (node) node.remove();
+};
+
+const showFieldSuggestion = (element, text = "") => {
+  const message = toText(text);
+  if (!element || !message) return;
+  const host = getFieldSuggestionHost(element);
+  if (!host) return;
+
+  const token = getFieldSuggestionToken(element);
+  if (!token) return;
+  let node = host.querySelector?.(`[${FIELD_SUGGESTION_NODE_ATTR}="${cssEscape(token)}"]`);
+
+  if (!node) {
+    node = document.createElement("div");
+    node.setAttribute(FIELD_SUGGESTION_NODE_ATTR, token);
+    node.style.display = "block";
+    node.style.margin = "0 0 4px 0";
+    node.style.padding = "2px 6px";
+    node.style.fontSize = "10px";
+    node.style.fontWeight = "600";
+    node.style.lineHeight = "1.3";
+    node.style.borderRadius = "6px";
+    node.style.background = "#fff7ed";
+    node.style.border = "1px solid #fed7aa";
+    node.style.color = "#9a3412";
+    if (element.parentElement === host) {
+      host.insertBefore(node, element);
+    } else {
+      host.prepend(node);
+    }
+  }
+
+  node.textContent = message;
+};
+
+const deriveFieldSuggestions = (field = {}, dataset = {}) => {
+  return buildReasonedCandidateRanking(field, dataset, [])
+    .slice(0, 3)
+    .map((item) => toText(item?.key))
+    .filter(Boolean);
+};
+
+const applyFieldVisualStatus = (element, status = "ok", reason = "") => {
+  if (!element) return;
+  const cleanStatus = normalize(status) || "ok";
+  const borderColor =
+    cleanStatus === "ok" ? "#16a34a" : cleanStatus === "warning" ? "#b45309" : "#b91c1c";
+  const glowColor =
+    cleanStatus === "ok"
+      ? "rgba(34, 197, 94, 0.24)"
+      : cleanStatus === "warning"
+        ? "rgba(245, 158, 11, 0.24)"
+        : "rgba(239, 68, 68, 0.24)";
+
+  element.style.outline = `2px solid ${borderColor}`;
+  element.style.outlineOffset = "1px";
+  element.style.boxShadow = `0 0 0 3px ${glowColor}`;
+  element.setAttribute("data-gov-assist-field-status", cleanStatus);
+
+  const titlePrefix =
+    cleanStatus === "ok" ? "GREEN TICK" : cleanStatus === "warning" ? "REVIEW REQUIRED" : "BLOCKED";
+  const finalTitle = reason ? `${titlePrefix}: ${reason}` : titlePrefix;
+  element.setAttribute("title", finalTitle);
+
+  if (cleanStatus === "ok") {
+    clearFieldSuggestion(element);
+  }
+};
+
+const pushFieldAudit = (bucket, item = {}) => {
+  if (!Array.isArray(bucket)) return;
+  if (bucket.length >= 220) return;
+  const status = toText(item?.status || "review");
+  const field = toText(item?.field || "");
+  const reason = toText(item?.reason || "");
+  const sourceKey = toText(item?.source_key || "");
+  if (!field && !reason && !sourceKey) return;
+  bucket.push({
+    phase: toText(item?.phase || "heuristic"),
+    field,
+    selector: toText(item?.selector || ""),
+    source_key: sourceKey,
+    status,
+    value_preview: toText(item?.value_preview || ""),
     reason,
   });
 };
@@ -860,7 +1379,7 @@ const fillSelect = (element, value) => {
   return true;
 };
 
-const fillRadio = (field, key, dataset) => {
+const fillRadio = (field, key, dataset, preferredValue = "") => {
   const name = toText(field.element.getAttribute("name"));
   if (!name) return false;
   const radios = Array.from(document.querySelectorAll(`input[type="radio"][name="${cssEscape(name)}"]`)).filter(isVisible);
@@ -871,8 +1390,8 @@ const fillRadio = (field, key, dataset) => {
     key,
     `${field.label || ""} ${field.placeholder || ""} ${field.name || ""} ${field.id || ""}`
   );
-  const desired = normalize(resolved.value || "");
-  const boolDesired = toBooleanText(resolved.value || "");
+  const desired = normalize(preferredValue || resolved.value || "");
+  const boolDesired = toBooleanText(preferredValue || resolved.value || "");
   let chosen =
     radios.find((radio) => normalize(radio.value) === desired || getDescriptor(radio).includes(desired)) ||
     null;
@@ -901,13 +1420,16 @@ const fillRadio = (field, key, dataset) => {
   return true;
 };
 
-const fillCheckbox = (field, key, dataset) => {
+const fillCheckbox = (field, key, dataset, preferredValue = "") => {
   const resolved = getDatasetValue(
     dataset,
     key,
     `${field.label || ""} ${field.placeholder || ""} ${field.name || ""} ${field.id || ""}`
   );
-  const raw = toBooleanText(resolved.value || "");
+  const canonicalKey = canonicalizeKey(key) || key;
+  const fallbackValue =
+    canonicalKey === "consent_authentication" && hasConsentIntent(getFieldDescriptorText(field)) ? "yes" : "";
+  const raw = toBooleanText(preferredValue || resolved.value || fallbackValue);
   if (!raw) return false;
   const shouldCheck = raw === "yes";
   if (shouldCheck !== field.element.checked) {
@@ -917,8 +1439,58 @@ const fillCheckbox = (field, key, dataset) => {
   return true;
 };
 
-const fillInput = (field, value) => {
-  const finalValue = field.type === "date" ? toInputDate(value) : toText(value);
+const normalizeValueForSourceKey = (sourceKey = "", value = "") => {
+  const key = canonicalizeKey(sourceKey) || sourceKey;
+  const text = toText(value);
+  if (!key || !text) return text;
+
+  if (["aadhaar_number", "eshram_uan", "vid_number", "bank_account", "phone", "pincode"].includes(key)) {
+    return digitsOnly(text);
+  }
+  if (key === "pan_number") {
+    return text.replace(/\s+/g, "").toUpperCase();
+  }
+  if (key === "ifsc_code") {
+    return text.replace(/\s+/g, "").toUpperCase();
+  }
+  if (key === "verification_type") {
+    const normalized = normalize(text);
+    if (normalized.includes("vid")) return "vid";
+    if (normalized.includes("aadhaar") || normalized.includes("aadhar")) return "aadhaar";
+  }
+  if (key === "consent_authentication") {
+    const bool = toBooleanText(text);
+    return bool || text;
+  }
+  return text;
+};
+
+const isEquivalentAutofillValue = (field = {}, expected = "", actual = "", sourceKey = "") => {
+  const expectedText = toText(expected);
+  const actualText = toText(actual);
+  if (!expectedText || !actualText) return false;
+  if (expectedText === actualText) return true;
+  if (normalize(expectedText) === normalize(actualText)) return true;
+
+  const key = canonicalizeKey(sourceKey) || sourceKey;
+  if (["aadhaar_number", "eshram_uan", "vid_number", "bank_account", "phone", "pincode"].includes(key)) {
+    return digitsOnly(expectedText) && digitsOnly(expectedText) === digitsOnly(actualText);
+  }
+  if (["pan_number", "ifsc_code"].includes(key)) {
+    return normalizeValueForSourceKey(key, expectedText) === normalizeValueForSourceKey(key, actualText);
+  }
+
+  const type = normalize(field?.type || field?.tag || "");
+  if (type === "date") {
+    return toInputDate(expectedText) === toInputDate(actualText);
+  }
+
+  return false;
+};
+
+const fillInput = (field, value, sourceKey = "") => {
+  const normalizedValue = normalizeValueForSourceKey(sourceKey, value);
+  const finalValue = field.type === "date" ? toInputDate(normalizedValue) : toText(normalizedValue);
   if (!finalValue) return false;
   const element = field.element;
   if (element.disabled || element.readOnly) return false;
@@ -926,12 +1498,12 @@ const fillInput = (field, value) => {
   element.focus();
   setElementValueCompat(element, finalValue);
   fireFieldEvents(element);
-  if (toText(element.value) !== finalValue) {
+  if (!isEquivalentAutofillValue(field, finalValue, toText(element.value), sourceKey)) {
     setElementValueCompat(element, finalValue);
     fireFieldEvents(element);
   }
   element.blur();
-  return toText(element.value) === finalValue;
+  return isEquivalentAutofillValue(field, finalValue, toText(element.value), sourceKey);
 };
 
 const normalizeDocumentName = (name) => {
@@ -1531,8 +2103,30 @@ const buildDataset = (envelope) => {
   docs.forEach((doc) => {
     const extracted = doc?.extracted_data || {};
     const autofill = doc?.autofill_fields || {};
+    const dynamicAutofill =
+      doc?.dynamic_schema?.autofill_payload && typeof doc.dynamic_schema.autofill_payload === "object"
+        ? doc.dynamic_schema.autofill_payload
+        : {};
+    const dynamicFields = Array.isArray(doc?.dynamic_schema?.fields) ? doc.dynamic_schema.fields : [];
     mergeSource(extracted);
     mergeSource(autofill);
+    mergeSource(dynamicAutofill);
+
+    dynamicFields.forEach((schemaField) => {
+      const canonicalKey = normalizeKeyToken(
+        schemaField?.canonical_key || schemaField?.source_key || schemaField?.key || ""
+      );
+      const textValue = toText(schemaField?.value || "");
+      if (!canonicalKey || !textValue) return;
+      mergeSource({ [canonicalKey]: textValue });
+
+      const aliases = Array.isArray(schemaField?.aliases) ? schemaField.aliases : [];
+      aliases.forEach((alias) => {
+        const normalizedAlias = normalizeKeyToken(alias);
+        if (!normalizedAlias) return;
+        mergeSource({ [normalizedAlias]: textValue });
+      });
+    });
   });
 
   const dataset = {};
@@ -1562,8 +2156,21 @@ const buildDataset = (envelope) => {
   if (!dataset.pincode && (dataset.location_pincode || dataset.location_pin_code)) {
     dataset.pincode = dataset.location_pincode || dataset.location_pin_code;
   }
+  if (!dataset.consent_authentication && (dataset.consent || dataset.authentication_consent)) {
+    dataset.consent_authentication = dataset.consent || dataset.authentication_consent;
+  }
+  if (!dataset.consent_authentication) dataset.consent_authentication = "yes";
   if (!dataset.verification_type) dataset.verification_type = "aadhaar";
   return dataset;
+};
+
+const getFallbackValueForFieldKey = (field = {}, key = "") => {
+  const canonicalKey = canonicalizeKey(key) || key;
+  if (!canonicalKey) return "";
+  if (canonicalKey === "consent_authentication" && hasConsentIntent(getFieldDescriptorText(field))) {
+    return "yes";
+  }
+  return "";
 };
 
 const runStepAutofill = async ({
@@ -1574,6 +2181,7 @@ const runStepAutofill = async ({
   actions,
   missingDocuments,
   matchingInsights = [],
+  fieldAudit = [],
   lockedSelectors = new Set(),
 }) => {
   for (const field of fields) {
@@ -1582,14 +2190,36 @@ const runStepAutofill = async ({
     const detectedKey = detectFieldKey(field);
     const datasetMatchedKey = detectFieldKeyFromDataset(field, dataset);
     const dropdownInferredKey = inferDropdownKeyFromOptions(field);
-    const keyCandidates = Array.from(
+    const seedCandidates = Array.from(
       new Set([detectedKey, datasetMatchedKey, dropdownInferredKey].map((item) => toText(item)).filter(Boolean))
     );
+    const keyCandidates = buildReasonedCandidateRanking(field, dataset, seedCandidates)
+      .slice(0, 8)
+      .map((item) => toText(item?.key))
+      .filter(Boolean);
     const resolvedEntry = resolveDatasetEntryForField(field, dataset, keyCandidates);
 
-    const key = toText(resolvedEntry.key) || keyCandidates[0] || "";
-    const value = toText(resolvedEntry.value);
-    if (!key && field.type !== "file") continue;
+    const rawKey = toText(resolvedEntry.key) || keyCandidates[0] || "";
+    const key = canonicalizeKey(rawKey) || rawKey;
+    const value = toText(resolvedEntry.value) || getFallbackValueForFieldKey(field, key);
+    if (!key && field.type !== "file") {
+      const suggestions = deriveFieldSuggestions(field, dataset);
+      if (suggestions.length > 0) {
+        showFieldSuggestion(field.element, `Suggestion: ${suggestions.join(" / ")}`);
+      } else {
+        showFieldSuggestion(field.element, "Suggestion: fill this field manually.");
+      }
+      applyFieldVisualStatus(field.element, "warning", "No reliable mapping found.");
+      pushFieldAudit(fieldAudit, {
+        phase: "heuristic",
+        field: formatFieldDisplayName(field),
+        selector: field.selector,
+        source_key: "",
+        status: "review",
+        reason: "No reliable key match found for this field.",
+      });
+      continue;
+    }
 
     if (field.type === "file") {
       const matchedDoc = resolveUploadDocument(field, documents, {
@@ -1605,6 +2235,16 @@ const runStepAutofill = async ({
             selector: field.selector,
             file_url: matchedDoc.cloudinary_url,
             document_name: matchedDoc.document_name,
+          });
+          applyFieldVisualStatus(field.element, "ok", "GREEN TICK: Document uploaded.");
+          pushFieldAudit(fieldAudit, {
+            phase: "heuristic",
+            field: formatFieldDisplayName(field),
+            selector: field.selector,
+            source_key: "document_match",
+            status: "ok",
+            value_preview: toText(matchedDoc?.document_name || ""),
+            reason: "GREEN TICK: Matching uploaded document linked successfully.",
           });
           pushMatchingInsight(matchingInsights, {
             phase: "heuristic",
@@ -1629,6 +2269,16 @@ const runStepAutofill = async ({
             document_name: generatedFile.name,
             source_key: "generated_fallback",
           });
+          applyFieldVisualStatus(field.element, "warning", "Generated fallback upload used.");
+          pushFieldAudit(fieldAudit, {
+            phase: "heuristic",
+            field: formatFieldDisplayName(field),
+            selector: field.selector,
+            source_key: "generated_fallback",
+            status: "review",
+            value_preview: toText(generatedFile?.name || ""),
+            reason: "Uploaded generated fallback file because matching document was not found.",
+          });
           pushMatchingInsight(matchingInsights, {
             phase: "heuristic",
             action: "upload_generated_document",
@@ -1642,17 +2292,52 @@ const runStepAutofill = async ({
         missingDocuments.add(
           matchedDoc?.document_name || field.label || field.name || field.id || "file_upload"
         );
+        applyFieldVisualStatus(field.element, "warning", MISSING_DATA_WARNING_TEXT);
+        pushFieldAudit(fieldAudit, {
+          phase: "heuristic",
+          field: formatFieldDisplayName(field),
+          selector: field.selector,
+          source_key: "document_match",
+          status: "missing_data",
+          reason: MISSING_DATA_WARNING_TEXT,
+        });
       }
       continue;
     }
 
-    if (!value) continue;
+    const validation = validateResolvedCandidate({ field, key, value });
+    if (!validation.ok) {
+      applyFieldVisualStatus(field.element, "warning", validation.reason || "Review required.");
+      const suggestions = deriveFieldSuggestions(field, dataset);
+      if (suggestions.length > 0) {
+        showFieldSuggestion(field.element, `Suggestion: ${suggestions.join(" / ")}`);
+      }
+      pushFieldAudit(fieldAudit, {
+        phase: "heuristic",
+        field: formatFieldDisplayName(field),
+        selector: field.selector,
+        source_key: key || rawKey,
+        status: validation.missingData ? "missing_data" : "review",
+        value_preview: buildValuePreview(key || rawKey, value),
+        reason: validation.reason || "Candidate mapping skipped due validation guardrail.",
+      });
+      pushMatchingInsight(matchingInsights, {
+        phase: "heuristic",
+        action: "skip_fill",
+        field: formatFieldDisplayName(field),
+        source_key: key || rawKey,
+        value_preview: buildValuePreview(key || rawKey, value),
+        reason: validation.reason || "Candidate mapping skipped due validation guardrail.",
+      });
+      continue;
+    }
+
+    const sourceKey = validation.canonical_key || key;
 
     let filled = false;
     if (field.type === "select") {
       filled = fillSelect(field.element, value);
       if (filled) {
-        const sourceKey = key || detectedKey || datasetMatchedKey || dropdownInferredKey || "";
         actions.push({
           type: "select_dropdown",
           field: field.name || field.id || key,
@@ -1672,9 +2357,8 @@ const runStepAutofill = async ({
         });
       }
     } else if (field.type === "radio") {
-      filled = fillRadio(field, key, dataset);
+      filled = fillRadio(field, sourceKey, dataset, value);
       if (filled) {
-        const sourceKey = key || detectedKey || datasetMatchedKey || "";
         actions.push({
           type: "click_radio",
           field: field.name || field.id || key,
@@ -1694,9 +2378,8 @@ const runStepAutofill = async ({
         });
       }
     } else if (field.type === "checkbox") {
-      filled = fillCheckbox(field, key, dataset);
+      filled = fillCheckbox(field, sourceKey, dataset, value);
       if (filled) {
-        const sourceKey = key || detectedKey || datasetMatchedKey || "";
         actions.push({
           type: "click_checkbox",
           field: field.name || field.id || key,
@@ -1716,9 +2399,8 @@ const runStepAutofill = async ({
         });
       }
     } else {
-      filled = fillInput(field, value);
+      filled = fillInput(field, value, sourceKey);
       if (filled) {
-        const sourceKey = key || detectedKey || datasetMatchedKey || "";
         actions.push({
           type: "fill_input",
           field: field.name || field.id || key,
@@ -1737,6 +2419,34 @@ const runStepAutofill = async ({
             "Matched input using placeholder/label/name/id and dataset key aliases.",
         });
       }
+    }
+
+    if (filled) {
+      applyFieldVisualStatus(field.element, "ok", `GREEN TICK: ${sourceKey}`);
+      pushFieldAudit(fieldAudit, {
+        phase: "heuristic",
+        field: formatFieldDisplayName(field),
+        selector: field.selector,
+        source_key: sourceKey,
+        status: "ok",
+        value_preview: buildValuePreview(sourceKey, value),
+        reason: "GREEN TICK: Field filled with validated mapping.",
+      });
+    } else if (field.required) {
+      applyFieldVisualStatus(field.element, "warning", "Required field still needs review.");
+      const suggestions = deriveFieldSuggestions(field, dataset);
+      if (suggestions.length > 0) {
+        showFieldSuggestion(field.element, `Suggestion: ${suggestions.join(" / ")}`);
+      }
+      pushFieldAudit(fieldAudit, {
+        phase: "heuristic",
+        field: formatFieldDisplayName(field),
+        selector: field.selector,
+        source_key: sourceKey,
+        status: "review",
+        value_preview: buildValuePreview(sourceKey, value),
+        reason: "Mapped value could not be applied; manual review required.",
+      });
     }
   }
 };
@@ -1921,6 +2631,7 @@ const applyPlannedActions = async ({
   actions,
   missingDocuments,
   matchingInsights = [],
+  fieldAudit = [],
   touchedSelectors = new Set(),
 }) => {
   const planned = Array.isArray(envelope?.payload?.automation_preview?.actions)
@@ -1937,15 +2648,55 @@ const applyPlannedActions = async ({
     if (!target?.element) continue;
     let element = target.element;
     let selector = target.selector || "";
+    let runtimeField =
+      fields.find((field) => field?.element === element || (selector && field?.selector === selector)) ||
+      toRuntimeFieldFromElement(element, selector);
     await ensureElementInView(element);
 
     if (type === "fill_input") {
+      const inferredKey =
+        toText(action?.source_key) ||
+        detectFieldKey(runtimeField) ||
+        detectFieldKeyFromDataset(runtimeField, dataset) ||
+        "";
+      const validation = validateResolvedCandidate({
+        field: runtimeField,
+        key: inferredKey,
+        value: action.value,
+      });
+      if (!validation.ok) {
+        applyFieldVisualStatus(runtimeField?.element, "warning", validation.reason || "Review required.");
+        const suggestions = deriveFieldSuggestions(runtimeField || {}, dataset);
+        if (suggestions.length > 0) {
+          showFieldSuggestion(runtimeField?.element, `Suggestion: ${suggestions.join(" / ")}`);
+        }
+        pushFieldAudit(fieldAudit, {
+          phase: "backend_plan",
+          field: formatFieldDisplayName(runtimeField || {}),
+          selector,
+          source_key: inferredKey || toText(action?.source_key),
+          status: validation.missingData ? "missing_data" : "review",
+          value_preview: buildValuePreview(inferredKey || toText(action?.field || ""), action.value),
+          reason: validation.reason || "Planned action skipped due validation guardrail.",
+        });
+        pushMatchingInsight(matchingInsights, {
+          phase: "backend_plan",
+          action: "skip_fill",
+          field: toText(action.field || element.getAttribute("name") || element.getAttribute("id") || ""),
+          source_key: inferredKey || toText(action?.source_key),
+          value_preview: buildValuePreview(inferredKey || toText(action?.field || ""), action.value),
+          reason: validation.reason || "Planned action skipped due validation guardrail.",
+        });
+        continue;
+      }
+      const sourceKey = validation.canonical_key || inferredKey || "planned_action";
       const filled = fillInput(
         {
           element,
           type: inferType(element),
         },
-        action.value
+        action.value,
+        sourceKey
       );
       if (filled) {
         appliedCount += 1;
@@ -1954,22 +2705,83 @@ const applyPlannedActions = async ({
           type: "fill_input",
           field: action.field || element.getAttribute("name") || element.getAttribute("id") || "",
           selector,
-          value: toText(action.value),
-          source_key: "planned_action",
+          value: toText(element.value || action.value),
+          source_key: sourceKey,
+        });
+        applyFieldVisualStatus(runtimeField?.element || element, "ok", `GREEN TICK: ${sourceKey}`);
+        pushFieldAudit(fieldAudit, {
+          phase: "backend_plan",
+          field: formatFieldDisplayName(runtimeField || {}),
+          selector,
+          source_key: sourceKey,
+          status: "ok",
+          value_preview: buildValuePreview(sourceKey, action.value),
+          reason: "GREEN TICK: Backend AI mapping applied successfully.",
         });
         pushMatchingInsight(matchingInsights, {
           phase: "backend_plan",
           action: "fill_input",
           field: toText(action.field || element.getAttribute("name") || element.getAttribute("id") || ""),
-          source_key: "planned_action",
-          value_preview: buildValuePreview(toText(action.field || ""), action.value),
+          source_key: sourceKey,
+          value_preview: buildValuePreview(sourceKey, action.value),
           reason: "Applied backend AI mapping plan using planned selector/field mapping.",
+        });
+      } else {
+        applyFieldVisualStatus(runtimeField?.element || element, "warning", "Planned value could not be applied.");
+        const suggestions = deriveFieldSuggestions(runtimeField || {}, dataset);
+        if (suggestions.length > 0) {
+          showFieldSuggestion(runtimeField?.element || element, `Suggestion: ${suggestions.join(" / ")}`);
+        }
+        pushFieldAudit(fieldAudit, {
+          phase: "backend_plan",
+          field: formatFieldDisplayName(runtimeField || {}),
+          selector,
+          source_key: sourceKey,
+          status: "review",
+          value_preview: buildValuePreview(sourceKey, action.value),
+          reason: "Backend planned value could not be set on the element.",
         });
       }
       continue;
     }
 
     if (type === "select_dropdown") {
+      const inferredKey =
+        toText(action?.source_key) ||
+        detectFieldKey(runtimeField) ||
+        detectFieldKeyFromDataset(runtimeField, dataset) ||
+        "";
+      const validation = validateResolvedCandidate({
+        field: runtimeField,
+        key: inferredKey,
+        value: action.value,
+      });
+      if (!validation.ok) {
+        applyFieldVisualStatus(runtimeField?.element, "warning", validation.reason || "Review required.");
+        const suggestions = deriveFieldSuggestions(runtimeField || {}, dataset);
+        if (suggestions.length > 0) {
+          showFieldSuggestion(runtimeField?.element, `Suggestion: ${suggestions.join(" / ")}`);
+        }
+        pushFieldAudit(fieldAudit, {
+          phase: "backend_plan",
+          field: formatFieldDisplayName(runtimeField || {}),
+          selector,
+          source_key: inferredKey || toText(action?.source_key),
+          status: validation.missingData ? "missing_data" : "review",
+          value_preview: buildValuePreview(inferredKey || toText(action?.field || ""), action.value),
+          reason: validation.reason || "Planned dropdown action skipped due validation guardrail.",
+        });
+        pushMatchingInsight(matchingInsights, {
+          phase: "backend_plan",
+          action: "skip_fill",
+          field: toText(action.field || element.getAttribute("name") || element.getAttribute("id") || ""),
+          source_key: inferredKey || toText(action?.source_key),
+          value_preview: buildValuePreview(inferredKey || toText(action?.field || ""), action.value),
+          reason: validation.reason || "Planned dropdown action skipped due validation guardrail.",
+        });
+        continue;
+      }
+      const sourceKey = validation.canonical_key || inferredKey || "planned_action";
       const selected = fillSelect(element, action.value);
       if (selected) {
         appliedCount += 1;
@@ -1979,21 +2791,84 @@ const applyPlannedActions = async ({
           field: action.field || element.getAttribute("name") || element.getAttribute("id") || "",
           selector,
           value: toText(action.value),
-          source_key: "planned_action",
+          source_key: sourceKey,
+        });
+        applyFieldVisualStatus(runtimeField?.element || element, "ok", `GREEN TICK: ${sourceKey}`);
+        pushFieldAudit(fieldAudit, {
+          phase: "backend_plan",
+          field: formatFieldDisplayName(runtimeField || {}),
+          selector,
+          source_key: sourceKey,
+          status: "ok",
+          value_preview: buildValuePreview(sourceKey, action.value),
+          reason: "GREEN TICK: Backend AI dropdown mapping applied successfully.",
         });
         pushMatchingInsight(matchingInsights, {
           phase: "backend_plan",
           action: "select_dropdown",
           field: toText(action.field || element.getAttribute("name") || element.getAttribute("id") || ""),
-          source_key: "planned_action",
-          value_preview: buildValuePreview(toText(action.field || ""), action.value),
+          source_key: sourceKey,
+          value_preview: buildValuePreview(sourceKey, action.value),
           reason: "Applied backend AI plan and selected nearest dropdown option.",
+        });
+      } else {
+        applyFieldVisualStatus(runtimeField?.element || element, "warning", "Planned dropdown value not available.");
+        const suggestions = deriveFieldSuggestions(runtimeField || {}, dataset);
+        if (suggestions.length > 0) {
+          showFieldSuggestion(runtimeField?.element || element, `Suggestion: ${suggestions.join(" / ")}`);
+        }
+        pushFieldAudit(fieldAudit, {
+          phase: "backend_plan",
+          field: formatFieldDisplayName(runtimeField || {}),
+          selector,
+          source_key: sourceKey,
+          status: "review",
+          value_preview: buildValuePreview(sourceKey, action.value),
+          reason: "Backend planned dropdown value could not be selected.",
         });
       }
       continue;
     }
 
     if (type === "click") {
+      const clickType = normalize(runtimeField?.type || inferType(element));
+      const inferredKey =
+        toText(action?.source_key) ||
+        detectFieldKey(runtimeField) ||
+        detectFieldKeyFromDataset(runtimeField, dataset) ||
+        "";
+      if (["radio", "checkbox"].includes(clickType) && toText(action?.value)) {
+        const validation = validateResolvedCandidate({
+          field: runtimeField,
+          key: inferredKey,
+          value: action.value,
+        });
+        if (!validation.ok) {
+          applyFieldVisualStatus(runtimeField?.element || element, "warning", validation.reason || "Review required.");
+          const suggestions = deriveFieldSuggestions(runtimeField || {}, dataset);
+          if (suggestions.length > 0) {
+            showFieldSuggestion(runtimeField?.element || element, `Suggestion: ${suggestions.join(" / ")}`);
+          }
+          pushFieldAudit(fieldAudit, {
+            phase: "backend_plan",
+            field: formatFieldDisplayName(runtimeField || {}),
+            selector,
+            source_key: inferredKey || toText(action?.source_key),
+            status: validation.missingData ? "missing_data" : "review",
+            value_preview: buildValuePreview(inferredKey || toText(action?.field || ""), action.value),
+            reason: validation.reason || "Planned click action skipped due validation guardrail.",
+          });
+          pushMatchingInsight(matchingInsights, {
+            phase: "backend_plan",
+            action: "skip_fill",
+            field: toText(action.field || element.getAttribute("name") || element.getAttribute("id") || ""),
+            source_key: inferredKey || toText(action?.source_key),
+            value_preview: buildValuePreview(inferredKey || toText(action?.field || ""), action.value),
+            reason: validation.reason || "Planned click action skipped due validation guardrail.",
+          });
+          continue;
+        }
+      }
       element.click();
       fireFieldEvents(element);
       appliedCount += 1;
@@ -2003,21 +2878,31 @@ const applyPlannedActions = async ({
         field: action.field || element.getAttribute("name") || element.getAttribute("id") || "",
         selector,
         value: toText(action.value),
-        source_key: "planned_action",
+        source_key: inferredKey || "planned_action",
+      });
+      applyFieldVisualStatus(runtimeField?.element || element, "ok", "GREEN TICK: Planned click action applied.");
+      pushFieldAudit(fieldAudit, {
+        phase: "backend_plan",
+        field: formatFieldDisplayName(runtimeField || {}),
+        selector,
+        source_key: inferredKey || "planned_action",
+        status: "ok",
+        value_preview: buildValuePreview(inferredKey || toText(action?.field || ""), action.value),
+        reason: "GREEN TICK: Planned click action applied.",
       });
       pushMatchingInsight(matchingInsights, {
         phase: "backend_plan",
         action: "click",
         field: toText(action.field || element.getAttribute("name") || element.getAttribute("id") || ""),
-        source_key: "planned_action",
-        value_preview: buildValuePreview(toText(action.field || ""), action.value),
+        source_key: inferredKey || "planned_action",
+        value_preview: buildValuePreview(inferredKey || toText(action.field || ""), action.value),
         reason: "Applied backend AI planned click action.",
       });
       continue;
     }
 
     if (type === "upload_file") {
-      let runtimeField =
+      runtimeField =
         fields.find((field) => field?.element === element || (selector && field?.selector === selector)) ||
         null;
 
@@ -2062,6 +2947,16 @@ const applyPlannedActions = async ({
             document_name: preferredName,
             source_key: "planned_action",
           });
+          applyFieldVisualStatus(runtimeField.element, "ok", "GREEN TICK: Planned document uploaded.");
+          pushFieldAudit(fieldAudit, {
+            phase: "backend_plan",
+            field: toText(action.field || runtimeField?.label || "upload"),
+            selector,
+            source_key: "planned_action",
+            status: "ok",
+            value_preview: toText(preferredName || ""),
+            reason: "GREEN TICK: Planned document upload completed.",
+          });
           pushMatchingInsight(matchingInsights, {
             phase: "backend_plan",
             action: "upload_file",
@@ -2093,6 +2988,16 @@ const applyPlannedActions = async ({
               file_url: matchedDoc.cloudinary_url,
               document_name: toText(matchedDoc.document_name || preferredName),
               source_key: "planned_action_document_fallback",
+            });
+            applyFieldVisualStatus(runtimeField.element, "ok", "GREEN TICK: Matched document uploaded.");
+            pushFieldAudit(fieldAudit, {
+              phase: "backend_plan",
+              field: toText(action.field || runtimeField?.label || "upload"),
+              selector,
+              source_key: "planned_action_document_fallback",
+              status: "ok",
+              value_preview: toText(matchedDoc?.document_name || preferredName || ""),
+              reason: "GREEN TICK: Best matching uploaded document was used.",
             });
             pushMatchingInsight(matchingInsights, {
               phase: "backend_plan",
@@ -2127,6 +3032,16 @@ const applyPlannedActions = async ({
             document_name: generatedFile.name,
             source_key: "planned_action_generated_fallback",
           });
+          applyFieldVisualStatus(runtimeField.element, "warning", "Generated fallback upload used.");
+          pushFieldAudit(fieldAudit, {
+            phase: "backend_plan",
+            field: toText(action.field || runtimeField?.label || "upload"),
+            selector,
+            source_key: "planned_action_generated_fallback",
+            status: "review",
+            value_preview: toText(generatedFile?.name || ""),
+            reason: "Generated fallback upload used; review document suitability.",
+          });
           pushMatchingInsight(matchingInsights, {
             phase: "backend_plan",
             action: "upload_generated_document",
@@ -2138,6 +3053,15 @@ const applyPlannedActions = async ({
         }
       } catch {
         missingDocuments.add(preferredName || "upload");
+        applyFieldVisualStatus(runtimeField?.element, "warning", MISSING_DATA_WARNING_TEXT);
+        pushFieldAudit(fieldAudit, {
+          phase: "backend_plan",
+          field: toText(action.field || runtimeField?.label || "upload"),
+          selector,
+          source_key: "planned_action",
+          status: "missing_data",
+          reason: MISSING_DATA_WARNING_TEXT,
+        });
       }
     }
   }
@@ -2156,6 +3080,7 @@ const runAutofillWorkflow = async (envelope, { allowMultiStep = true } = {}) => 
   const allSchemas = [];
   const stepSummary = [];
   const matchingInsights = [];
+  const fieldStatusAudit = [];
   const missingDocuments = new Set();
   const visitedNextButtons = new Set();
   const touchedSelectors = new Set();
@@ -2228,6 +3153,7 @@ const runAutofillWorkflow = async (envelope, { allowMultiStep = true } = {}) => 
         actions,
         missingDocuments,
         matchingInsights,
+        fieldAudit: fieldStatusAudit,
         touchedSelectors,
       });
     }
@@ -2239,6 +3165,7 @@ const runAutofillWorkflow = async (envelope, { allowMultiStep = true } = {}) => 
       actions,
       missingDocuments,
       matchingInsights,
+      fieldAudit: fieldStatusAudit,
       lockedSelectors: touchedSelectors,
     });
 
@@ -2287,6 +3214,13 @@ const runAutofillWorkflow = async (envelope, { allowMultiStep = true } = {}) => 
     assistantRecommendations.push(
       `Missing profile values: ${backendPlanState.missing_profile_fields.join(", ")}.`
     );
+    assistantRecommendations.push(MISSING_DATA_WARNING_TEXT);
+  }
+  if (backendPlanState.missing_required_documents.length > 0) {
+    assistantRecommendations.push(MISSING_DATA_WARNING_TEXT);
+  }
+  if (missingDocuments.size > 0 || fieldStatusAudit.some((item) => item?.status === "missing_data")) {
+    assistantRecommendations.push(MISSING_DATA_WARNING_TEXT);
   }
   if (validationMissing.length > 0) {
     assistantRecommendations.push(
@@ -2320,6 +3254,7 @@ const runAutofillWorkflow = async (envelope, { allowMultiStep = true } = {}) => 
     },
     step_summary: stepSummary,
     matching_insights: matchingInsights,
+    field_status_audit: fieldStatusAudit,
     placeholder_crawl: {
       total_fields_scanned: uniqueSchemas.length,
       fields_with_placeholder: fieldsWithPlaceholder,
@@ -2375,6 +3310,14 @@ const showResultPanel = (result) => {
   const matchingInsights = Array.isArray(safeResult.matching_insights)
     ? safeResult.matching_insights
     : [];
+  const fieldAudit = Array.isArray(safeResult.field_status_audit)
+    ? safeResult.field_status_audit
+    : [];
+  const greenTickCount = fieldAudit.filter((item) => normalize(item?.status) === "ok").length;
+  const reviewCount = fieldAudit.filter((item) =>
+    ["review", "missing_data"].includes(normalize(item?.status))
+  ).length;
+  const missingDataCount = fieldAudit.filter((item) => normalize(item?.status) === "missing_data").length;
   const placeholderStats =
     safeResult?.placeholder_crawl && typeof safeResult.placeholder_crawl === "object"
       ? safeResult.placeholder_crawl
@@ -2394,6 +3337,12 @@ const showResultPanel = (result) => {
     </p>
     <p style="margin:6px 0 0;color:${missingDocs.length ? "#b45309" : "#166534"};">
       Missing documents: <b>${missingDocs.length}</b>
+    </p>
+    <p style="margin:6px 0 0;color:#166534;">
+      GREEN TICK fields: <b>${greenTickCount}</b>
+    </p>
+    <p style="margin:6px 0 0;color:${reviewCount ? "#b45309" : "#166534"};">
+      Review fields: <b>${reviewCount}</b>${missingDataCount ? ` | Missing data alerts: <b>${missingDataCount}</b>` : ""}
     </p>
     <p style="margin:6px 0 0;color:#334155;">
       Placeholder crawl: <b>${Number(placeholderStats.fields_with_placeholder || 0)}</b> /
@@ -2425,6 +3374,38 @@ const showResultPanel = (result) => {
       ${
         matchingInsights.length > 12
           ? `<p style="margin:8px 0 0;color:#64748b;">Showing first 12 of ${matchingInsights.length} matching decisions.</p>`
+          : ""
+      }
+    </details>`
+        : ""
+    }
+    ${
+      fieldAudit.length > 0
+        ? `<details style="margin-top:8px;">
+      <summary style="cursor:pointer;color:#1d4ed8;">Field status audit (${fieldAudit.length})</summary>
+      <ul style="margin:8px 0 0 16px;padding:0;color:#334155;">
+        ${fieldAudit
+          .slice(0, 14)
+          .map((item) => {
+            const field = toText(item?.field || "field");
+            const source = toText(item?.source_key || "");
+            const reason = toText(item?.reason || "");
+            const valuePreview = toText(item?.value_preview || "");
+            const status = normalize(item?.status || "review");
+            const statusLabel = status === "ok" ? "GREEN TICK" : status === "missing_data" ? "MISSING DATA" : "REVIEW";
+            const statusColor = status === "ok" ? "#166534" : status === "missing_data" ? "#b91c1c" : "#b45309";
+            return `<li style="margin:4px 0;">
+              <div><b style="color:${statusColor};">${statusLabel}</b> | <b>${field}</b>${
+                source ? ` <- ${source}` : ""
+              }${valuePreview ? ` = ${valuePreview}` : ""}</div>
+              ${reason ? `<div style="color:#64748b;">${reason}</div>` : ""}
+            </li>`;
+          })
+          .join("")}
+      </ul>
+      ${
+        fieldAudit.length > 14
+          ? `<p style="margin:8px 0 0;color:#64748b;">Showing first 14 of ${fieldAudit.length} field statuses.</p>`
           : ""
       }
     </details>`
@@ -2535,7 +3516,10 @@ const runWithEnvelope = async (envelope, source) => {
     });
     showResultPanel(result);
     if (result.missing_required_fields.length > 0 || result.missing_required_documents.length > 0) {
-      showToast("Autofill completed with some missing fields/documents. Review required.", "error");
+      showToast(
+        `${MISSING_DATA_WARNING_TEXT}. Autofill completed with missing fields/documents. Review required.`,
+        "error"
+      );
     } else {
       showToast(`Autofill completed. ${result.actions.length} action(s) prepared/applied.`, "success");
     }

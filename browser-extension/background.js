@@ -456,6 +456,8 @@ const toDocumentList = (documents = []) =>
         doc?.extracted_data && typeof doc.extracted_data === "object" ? doc.extracted_data : {},
       autofill_fields:
         doc?.autofill_fields && typeof doc.autofill_fields === "object" ? doc.autofill_fields : {},
+      dynamic_schema:
+        doc?.dynamic_schema && typeof doc.dynamic_schema === "object" ? doc.dynamic_schema : {},
     }))
     .filter((doc) => doc.document_name && doc.cloudinary_url);
 
@@ -559,17 +561,31 @@ const fillMissingFromDocuments = (profile = {}, documents = []) => {
   for (const doc of documents) {
     const extracted = doc?.extracted_data || {};
     const autofill = doc?.autofill_fields || {};
+    const dynamicAutofill =
+      doc?.dynamic_schema?.autofill_payload && typeof doc.dynamic_schema.autofill_payload === "object"
+        ? doc.dynamic_schema.autofill_payload
+        : {};
 
     mergeIfMissing("name", extracted.name || extracted.candidate_name || autofill.applicant_name);
-    mergeIfMissing("date_of_birth", extracted.date_of_birth || autofill.dob);
-    mergeIfMissing("aadhaar_number", extracted.aadhaar_number || autofill.aadhaar);
-    mergeIfMissing("pan_number", extracted.pan_number || autofill.pan);
-    mergeIfMissing("income", extracted.annual_income || autofill.annual_income);
-    mergeIfMissing("bank_account", extracted.account_number || autofill.bank_account);
-    mergeIfMissing("ifsc_code", extracted.ifsc_code || autofill.ifsc);
-    mergeIfMissing("address", extracted.address || autofill.address);
+    mergeIfMissing("date_of_birth", extracted.date_of_birth || autofill.dob || dynamicAutofill.dob);
+    mergeIfMissing(
+      "aadhaar_number",
+      extracted.aadhaar_number || autofill.aadhaar || dynamicAutofill.aadhaar
+    );
+    mergeIfMissing("pan_number", extracted.pan_number || autofill.pan || dynamicAutofill.pan);
+    mergeIfMissing(
+      "income",
+      extracted.annual_income || autofill.annual_income || dynamicAutofill.annual_income
+    );
+    mergeIfMissing(
+      "bank_account",
+      extracted.account_number || autofill.bank_account || dynamicAutofill.bank_account
+    );
+    mergeIfMissing("ifsc_code", extracted.ifsc_code || autofill.ifsc || dynamicAutofill.ifsc);
+    mergeIfMissing("address", extracted.address || autofill.address || dynamicAutofill.address);
     mergeObjectScalars(extracted);
     mergeObjectScalars(autofill);
+    mergeObjectScalars(dynamicAutofill);
   }
   return output;
 };
@@ -646,10 +662,17 @@ const buildAutofillData = ({ userProfile = {}, documents = [] }) => {
   for (const doc of documents) {
     const extracted = doc?.extracted_data || {};
     const autofill = doc?.autofill_fields || {};
+    const dynamicAutofill =
+      doc?.dynamic_schema?.autofill_payload && typeof doc.dynamic_schema.autofill_payload === "object"
+        ? doc.dynamic_schema.autofill_payload
+        : {};
     Object.entries(extracted).forEach(([key, value]) => {
       mergeValueIfMissing(key, value);
     });
     Object.entries(autofill).forEach(([key, value]) => {
+      mergeValueIfMissing(key, value);
+    });
+    Object.entries(dynamicAutofill).forEach(([key, value]) => {
       mergeValueIfMissing(key, value);
     });
   }
@@ -1157,6 +1180,12 @@ const buildPlanFromBackend = async (message = {}) => {
         documents: documents.map((doc) => ({
           document_name: doc.document_name,
           cloudinary_url: doc.cloudinary_url,
+          extracted_data:
+            doc?.extracted_data && typeof doc.extracted_data === "object" ? doc.extracted_data : {},
+          autofill_fields:
+            doc?.autofill_fields && typeof doc.autofill_fields === "object" ? doc.autofill_fields : {},
+          dynamic_schema:
+            doc?.dynamic_schema && typeof doc.dynamic_schema === "object" ? doc.dynamic_schema : {},
         })),
       },
       form_structure: {

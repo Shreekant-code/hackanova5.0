@@ -157,7 +157,10 @@ const buildUploadSteps = ({ fields = [], requiredDocuments = [], uploadedDocumen
 export const generateAutomationStepsFromFormStructure = ({
   officialApplicationLink = "",
   userProfile = {},
+  userData = {},
+  profileData = {},
   uploadedDocuments = [],
+  documentsForSchema = [],
   requiredDocuments = [],
   formStructure = {},
   aiSuggestions = [],
@@ -174,6 +177,9 @@ export const generateAutomationStepsFromFormStructure = ({
   const mappingResult = buildFieldMappings({
     forms: [syntheticForm],
     userProfile,
+    userData,
+    profileData,
+    documents: documentsForSchema,
     portalCredentials: {},
     aiSuggestions,
   });

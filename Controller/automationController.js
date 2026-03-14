@@ -1,6 +1,7 @@
 import Profile from "../Schema/Profileschema.js";
 import Scheme from "../Schema/Schemeschema.js";
 import UserDocument from "../Schema/UserDocumentschema.js";
+import User from "../Schema/Userschema.js";
 import { getPortalSafetyReport } from "./automation/safetyPolicy.js";
 import { crawlFormRepresentation } from "./automation/formCrawler.js";
 import { getCachedFormCrawl, upsertFormCrawlCache } from "./automation/cacheService.js";
@@ -71,7 +72,7 @@ const pickSchemeLink = (schemeData = {}) =>
       ""
   ).trim();
 
-const unifyProfile = (profileFromDb = {}, profileInput = {}, documents = []) => {
+const unifyProfile = (profileFromDb = {}, profileInput = {}, documents = [], userFromDb = {}) => {
   const normalizeKey = (value) =>
     String(value || "")
       .trim()
@@ -80,7 +81,7 @@ const unifyProfile = (profileFromDb = {}, profileInput = {}, documents = []) => 
       .replace(/^_+|_+$/g, "");
 
   const profile = {
-    name: profileInput?.name || "",
+    name: profileInput?.name || userFromDb?.name || "",
     date_of_birth: profileInput?.date_of_birth || profileInput?.dob || "",
     age: profileInput?.age ?? profileFromDb?.age ?? "",
     gender: profileInput?.gender || profileFromDb?.gender || "",
@@ -96,7 +97,7 @@ const unifyProfile = (profileFromDb = {}, profileInput = {}, documents = []) => 
     pan_number: profileInput?.pan_number || "",
     bank_account: profileInput?.bank_account || "",
     ifsc_code: profileInput?.ifsc_code || "",
-    email: profileInput?.email || "",
+    email: profileInput?.email || userFromDb?.email || "",
     phone: profileInput?.phone || profileFromDb?.phone || "",
     address: profileInput?.address || "",
   };
@@ -110,22 +111,37 @@ const unifyProfile = (profileFromDb = {}, profileInput = {}, documents = []) => 
   for (const doc of documents) {
     const extracted = doc?.extracted_data || {};
     const autofill = doc?.autofill_fields || {};
+    const dynamicAutofill =
+      doc?.dynamic_schema?.autofill_payload && typeof doc.dynamic_schema.autofill_payload === "object"
+        ? doc.dynamic_schema.autofill_payload
+        : {};
     mergeIfMissing("name", extracted.name || extracted.candidate_name || autofill.applicant_name);
-    mergeIfMissing("date_of_birth", extracted.date_of_birth || autofill.dob);
-    mergeIfMissing("aadhaar_number", extracted.aadhaar_number || autofill.aadhaar);
-    mergeIfMissing("pan_number", extracted.pan_number || autofill.pan);
-    mergeIfMissing("income", extracted.annual_income || autofill.annual_income);
-    mergeIfMissing("bank_account", extracted.account_number || autofill.bank_account);
-    mergeIfMissing("ifsc_code", extracted.ifsc_code || autofill.ifsc);
-    mergeIfMissing("address", extracted.address || autofill.address);
+    mergeIfMissing("date_of_birth", extracted.date_of_birth || autofill.dob || dynamicAutofill.dob);
+    mergeIfMissing(
+      "aadhaar_number",
+      extracted.aadhaar_number || autofill.aadhaar || dynamicAutofill.aadhaar
+    );
+    mergeIfMissing("pan_number", extracted.pan_number || autofill.pan || dynamicAutofill.pan);
+    mergeIfMissing(
+      "income",
+      extracted.annual_income || autofill.annual_income || dynamicAutofill.annual_income
+    );
+    mergeIfMissing(
+      "bank_account",
+      extracted.account_number || autofill.bank_account || dynamicAutofill.bank_account
+    );
+    mergeIfMissing("ifsc_code", extracted.ifsc_code || autofill.ifsc || dynamicAutofill.ifsc);
+    mergeIfMissing("address", extracted.address || autofill.address || dynamicAutofill.address);
 
-    Object.entries({ ...(extracted || {}), ...(autofill || {}) }).forEach(([key, value]) => {
-      if (value === null || value === undefined || typeof value === "object") return;
-      const normalizedKey = normalizeKey(key);
-      const text = String(value).trim();
-      if (!normalizedKey || !text) return;
-      mergeIfMissing(normalizedKey, text);
-    });
+    Object.entries({ ...(extracted || {}), ...(autofill || {}), ...(dynamicAutofill || {}) }).forEach(
+      ([key, value]) => {
+        if (value === null || value === undefined || typeof value === "object") return;
+        const normalizedKey = normalizeKey(key);
+        const text = String(value).trim();
+        if (!normalizedKey || !text) return;
+        mergeIfMissing(normalizedKey, text);
+      }
+    );
   }
 
   return profile;
@@ -136,6 +152,12 @@ const mapUploadedDocs = (documents = []) =>
     .map((doc) => ({
       document_name: String(doc?.document_name || "").trim(),
       cloudinary_url: String(doc?.cloudinary_url || "").trim(),
+      extracted_data:
+        doc?.extracted_data && typeof doc.extracted_data === "object" ? doc.extracted_data : {},
+      autofill_fields:
+        doc?.autofill_fields && typeof doc.autofill_fields === "object" ? doc.autofill_fields : {},
+      dynamic_schema:
+        doc?.dynamic_schema && typeof doc.dynamic_schema === "object" ? doc.dynamic_schema : {},
     }))
     .filter((doc) => doc.document_name && doc.cloudinary_url);
 
@@ -385,6 +407,7 @@ export const generateFormAutofillPlan = async (req, res) => {
       officialApplicationLink = safety.normalized_url;
     }
 
+    const userFromDb = await User.findById(userId).select("name email").lean();
     const profileFromDb = await Profile.findOne({ user: userId }).lean();
     const dbUserDocuments = await UserDocument.find({ user_id: userId })
       .sort({ uploaded_at: -1 })
@@ -395,8 +418,20 @@ export const generateFormAutofillPlan = async (req, res) => {
     }));
     const providedDocuments = mapUploadedDocs(userDocumentsInput);
     const mergedDocuments = providedDocuments.length > 0 ? providedDocuments : fallbackDocuments;
+    const documentsForSchema = dbUserDocuments.length > 0 ? dbUserDocuments : providedDocuments;
 
-    const mergedProfile = unifyProfile(profileFromDb || {}, mergedInputProfile, dbUserDocuments);
+    const mergedUserData = {
+      name: String(userFromDb?.name || "").trim(),
+      email: String(userFromDb?.email || "").trim(),
+      ...(userDataInput && typeof userDataInput === "object" ? userDataInput : {}),
+    };
+
+    const mergedProfile = unifyProfile(
+      profileFromDb || {},
+      mergedInputProfile,
+      documentsForSchema,
+      userFromDb || {}
+    );
     const requiredDocuments = toStringList(schemeData?.documents_required);
     const syntheticForms = [
       {
@@ -406,12 +441,19 @@ export const generateFormAutofillPlan = async (req, res) => {
     ];
     const aiSuggestions = await inferFieldMappingsWithGemini({
       forms: syntheticForms,
+      userProfile: mergedProfile,
+      userData: mergedUserData,
+      profileData: profileFromDb || {},
+      documents: documentsForSchema,
     });
 
     const plan = generateAutomationStepsFromFormStructure({
       officialApplicationLink,
       userProfile: mergedProfile,
+      userData: mergedUserData,
+      profileData: profileFromDb || {},
       uploadedDocuments: mergedDocuments,
+      documentsForSchema,
       requiredDocuments,
       formStructure,
       aiSuggestions,
@@ -549,7 +591,8 @@ export const previewAutomationPlan = async (req, res) => {
   let portalUrl = "";
   try {
     const schemeData = req.body?.scheme_data || req.body?.schemeData || req.body || {};
-    const profileInput = req.body?.user_profile || req.body?.userProfile || {};
+    const profileInputRaw = req.body?.user_profile || req.body?.userProfile || {};
+    const profileInput = profileInputRaw && typeof profileInputRaw === "object" ? profileInputRaw : {};
     const providedDocuments = mapUploadedDocs(req.body?.documents || req.body?.user_documents || []);
     const portalCredentials = req.body?.portal_credentials || {};
     const forceRefresh = parseBool(req.body?.force_refresh, false);
@@ -587,6 +630,7 @@ export const previewAutomationPlan = async (req, res) => {
       });
     }
 
+    const userFromDb = await User.findById(userId).select("name email").lean();
     const profileFromDb = await Profile.findOne({ user: userId }).lean();
     const dbUserDocuments = await UserDocument.find({ user_id: userId })
       .sort({ uploaded_at: -1 })
@@ -597,7 +641,17 @@ export const previewAutomationPlan = async (req, res) => {
     }));
 
     const mergedDocuments = providedDocuments.length > 0 ? providedDocuments : fallbackDocuments;
-    const normalizedProfile = unifyProfile(profileFromDb || {}, profileInput, dbUserDocuments);
+    const documentsForSchema = dbUserDocuments.length > 0 ? dbUserDocuments : providedDocuments;
+    const mergedUserData = {
+      name: String(userFromDb?.name || "").trim(),
+      email: String(userFromDb?.email || "").trim(),
+    };
+    const normalizedProfile = unifyProfile(
+      profileFromDb || {},
+      profileInput,
+      documentsForSchema,
+      userFromDb || {}
+    );
     const requiredDocuments = toStringList(schemeData?.documents_required);
     const documentResolution = resolveRequiredDocumentMatches(requiredDocuments, mergedDocuments);
 
@@ -608,11 +662,19 @@ export const previewAutomationPlan = async (req, res) => {
 
     const aiSuggestions = await inferFieldMappingsWithGemini({
       forms: crawlData?.forms || [],
+      userProfile: normalizedProfile,
+      userData: mergedUserData,
+      profileData: profileFromDb || {},
+      documents: documentsForSchema,
+      portalCredentials,
     });
 
     const fieldMappings = buildFieldMappings({
       forms: crawlData?.forms || [],
       userProfile: normalizedProfile,
+      userData: mergedUserData,
+      profileData: profileFromDb || {},
+      documents: documentsForSchema,
       portalCredentials,
       aiSuggestions,
     });
