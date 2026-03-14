@@ -4,8 +4,10 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "test:documents": "node scripts/testDocumentEndpoints.mjs",
+    "test:automation": "node scripts/testAutomationLayer.mjs",
+    "test:system-pipeline": "node scripts/systemPipelineValidation.mjs"
   },
   "keywords": [],
   "author": "",
@@ -18,6 +20,9 @@
     "express": "^5.2.1",
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^9.3.0",
-    "nodemon": "^3.1.14"
+    "multer": "^2.1.1",
+    "nodemon": "^3.1.14",
+    "pdf-parse": "^1.1.1",
+    "tesseract.js": "^5.1.1"
   }
 }

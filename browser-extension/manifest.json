@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "Gov Assist Autofill",
+  "version": "1.0.0",
+  "description": "Autofill official government forms using data extracted in Gov Assist.",
+  "permissions": ["storage", "tabs", "activeTab", "scripting"],
+  "host_permissions": [
+    "http://localhost/*",
+    "https://localhost/*",
+    "http://127.0.0.1/*",
+    "https://127.0.0.1/*",
+    "https://*.gov.in/*",
+    "https://*.nic.in/*",
+    "https://*.gov/*",
+    "https://*.ac.in/*",
+    "https://maandhan.in/*",
+    "https://*.maandhan.in/*",
+    "https://res.cloudinary.com/*",
+    "https://*.cloudinary.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Gov Assist Autofill",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://localhost/*",
+        "https://localhost/*",
+        "http://127.0.0.1/*",
+        "https://127.0.0.1/*",
+        "https://*.gov.in/*",
+        "https://*.nic.in/*",
+        "https://*.gov/*",
+        "https://*.ac.in/*",
+        "https://maandhan.in/*",
+        "https://*.maandhan.in/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

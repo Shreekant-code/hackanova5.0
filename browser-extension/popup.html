@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Gov Assist Autofill</title>
+    <link rel="stylesheet" href="./popup.css" />
+  </head>
+  <body>
+    <main class="panel">
+      <p class="badge">Gov Assist</p>
+      <h1>Autofill Helper</h1>
+      <p class="sub">
+        Works with Apply flow and auto-bootstrap mode. Fills fields, uploads matched documents, and can generate fallback upload files when needed.
+      </p>
+
+      <section class="context">
+        <p class="label">Current Context</p>
+        <p id="contextText">Loading...</p>
+      </section>
+
+      <section class="context">
+        <p class="label">Profile Snapshot</p>
+        <p id="profileText">Loading...</p>
+      </section>
+
+      <section class="context">
+        <p class="label">Recommendation Basis</p>
+        <p id="recommendationText">Loading...</p>
+      </section>
+
+      <section class="context">
+        <p class="label">Last Run</p>
+        <p id="lastRunText">Not available</p>
+      </section>
+
+      <section class="context">
+        <p class="label">Matching Insights</p>
+        <div id="matchingText" class="matchingList">No matching insights yet.</div>
+      </section>
+
+      <div class="actions">
+        <button id="syncBtn" type="button" class="secondary">Sync Context From App</button>
+        <button id="fillBtn" type="button">Fill + Upload Current Page</button>
+        <button id="clearBtn" type="button" class="secondary">Clear Context</button>
+      </div>
+
+      <p id="statusText" class="status"></p>
+    </main>
+    <script src="./popup.js"></script>
+  </body>
+</html>

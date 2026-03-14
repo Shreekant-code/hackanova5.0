@@ -1,5 +1,6 @@
 import Profile from "../Schema/Profileschema.js";
 import Scheme from "../Schema/Schemeschema.js";
+import UserDocument from "../Schema/UserDocumentschema.js";
 import {
   inferOriginalApplyLinkFromSchemeName,
   resolveBestOriginalApplyLink,
@@ -7,14 +8,24 @@ import {
   validateEligibilityWithGemini,
 } from "./geminiEligibilityAgent.js";
 
-const MAX_SCORE = 10;
 const TOP_N = 7;
 const GEMINI_VALIDATION_LIMIT = 7;
+const RECOMMENDATION_ENGINE_VERSION = "v2_profile_document_aware";
 
-const OCCUPATION_WEIGHT = 4;
-const ELIGIBILITY_WEIGHT = 3;
-const STATE_WEIGHT = 2;
-const CATEGORY_WEIGHT = 1;
+const SCORE_WEIGHTS = {
+  occupation: 4,
+  eligibility_rule: 3,
+  state: 2,
+  category: 1,
+  gender: 1,
+  age: 1,
+  income: 1,
+};
+
+const MAX_SCORE = Object.values(SCORE_WEIGHTS).reduce(
+  (sum, value) => sum + Number(value || 0),
+  0
+);
 
 const OCCUPATION_KEYWORD_MAP = {
   student: ["student", "education", "scholarship", "phd", "masters", "college", "learner"],
@@ -30,8 +41,34 @@ const GENDER_KEYWORD_MAP = {
 };
 
 const CATEGORY_TOKENS = ["sc", "st", "obc", "ews", "general", "minority"];
+const GENERIC_RULE_VALUES = new Set([
+  "all",
+  "all states",
+  "all india",
+  "across india",
+  "pan india",
+  "general",
+  "any",
+  "na",
+  "n/a",
+  "not applicable",
+]);
+const DOCUMENT_HINT_FIELD_ALIASES = {
+  age: ["age", "applicant_age"],
+  occupation: ["occupation", "profession", "employment_type"],
+  category: ["category", "caste_category", "social_category"],
+  annual_income: ["annual_income", "income", "family_income", "household_income", "income_per_annum"],
+  gender: ["gender", "sex"],
+  state: ["state", "residence_state", "domicile_state"],
+};
 
 const normalize = (value) => String(value ?? "").trim().toLowerCase();
+const normalizeFieldKey = (value) =>
+  String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
 
 const toText = (value) => {
   if (value === null || value === undefined) return "";
@@ -57,6 +94,245 @@ const unique = (values) => Array.from(new Set(values.map((item) => normalize(ite
 
 const includesAny = (text, keywords) => keywords.some((keyword) => text.includes(normalize(keyword)));
 
+const splitRuleValues = (value) =>
+  unique(
+    String(value || "")
+      .split(/[,/|;&]+/g)
+      .map((item) => item.trim())
+      .filter(Boolean)
+  );
+
+const isGenericRuleValue = (value) => GENERIC_RULE_VALUES.has(normalize(value));
+
+const matchesLoosely = (left, right) => {
+  const a = normalize(left);
+  const b = normalize(right);
+  if (!a || !b) return false;
+  return a === b || a.includes(b) || b.includes(a);
+};
+
+const getProfileState = (profile = {}) =>
+  normalize(profile?.location?.state || profile?.state || "");
+
+const toComparableTextValue = (value) =>
+  String(value ?? "")
+    .trim()
+    .replace(/\s+/g, " ");
+
+const normalizeGenderValue = (value) => {
+  const text = normalize(value);
+  if (!text) return "";
+  if (/(female|women|woman|girl)/i.test(text)) return "female";
+  if (/(male|men|man|boy)/i.test(text)) return "male";
+  if (/(other|trans|nonbinary|non-binary)/i.test(text)) return "other";
+  return text;
+};
+
+const extractCategoryTokens = (value) => {
+  const text = normalize(value);
+  return CATEGORY_TOKENS.filter((token) => text.includes(token));
+};
+
+const evaluateDirectTextRuleMatch = (schemeValue, profileValue) => {
+  const ruleValues = splitRuleValues(schemeValue).filter((value) => !isGenericRuleValue(value));
+  if (ruleValues.length === 0) return { hasRule: false, comparable: false, matched: true, contradiction: false };
+
+  const userValue = normalize(profileValue);
+  if (!userValue) return { hasRule: true, comparable: false, matched: false, contradiction: false };
+
+  const matched = ruleValues.some((rule) => matchesLoosely(rule, userValue));
+  return {
+    hasRule: true,
+    comparable: true,
+    matched,
+    contradiction: !matched,
+  };
+};
+
+const evaluateDirectCategoryMatch = (schemeCategory, profileCategory) => {
+  const required = extractCategoryTokens(schemeCategory);
+  if (required.length === 0) {
+    return { hasRule: false, comparable: false, matched: true, contradiction: false };
+  }
+
+  const userTokens = extractCategoryTokens(profileCategory);
+  if (userTokens.length === 0) {
+    return { hasRule: true, comparable: false, matched: false, contradiction: false };
+  }
+
+  const matched = required.some((token) => userTokens.includes(token));
+  return {
+    hasRule: true,
+    comparable: true,
+    matched,
+    contradiction: !matched,
+  };
+};
+
+const evaluateDirectGenderMatch = (schemeGender, profileGender) => {
+  const rule = normalizeGenderValue(schemeGender);
+  if (!rule || isGenericRuleValue(rule) || rule === "all") {
+    return { hasRule: false, comparable: false, matched: true, contradiction: false };
+  }
+
+  const userGender = normalizeGenderValue(profileGender);
+  if (!userGender) return { hasRule: true, comparable: false, matched: false, contradiction: false };
+
+  const matched = matchesLoosely(rule, userGender);
+  return {
+    hasRule: true,
+    comparable: true,
+    matched,
+    contradiction: !matched,
+  };
+};
+
+const evaluateDirectOccupationMatch = ({
+  schemeOccupation = "",
+  userOccupationRaw = "",
+  userOccupationKeywords = [],
+}) => {
+  const schemeOcc = normalize(schemeOccupation);
+  if (!schemeOcc || isGenericRuleValue(schemeOcc)) {
+    return { hasRule: false, comparable: false, matched: true, contradiction: false };
+  }
+  if (
+    /(women|woman|female|girl|male|men|man|boy)/i.test(schemeOcc) &&
+    !/(student|farmer|agri|entrepreneur|startup|business|disabled|pwd|worker|labour|self employed)/i.test(
+      schemeOcc
+    )
+  ) {
+    return { hasRule: false, comparable: false, matched: true, contradiction: false };
+  }
+
+  if (!userOccupationRaw) {
+    return { hasRule: true, comparable: false, matched: false, contradiction: false };
+  }
+
+  const schemeKeywords = unique([
+    ...deriveOccupationGroupKeywords(schemeOcc),
+    ...tokenize(schemeOcc),
+    schemeOcc,
+  ]);
+  const userKeywords = unique([
+    ...userOccupationKeywords,
+    ...tokenize(userOccupationRaw),
+    userOccupationRaw,
+  ]);
+
+  const matched = schemeKeywords.some((required) =>
+    userKeywords.some((present) => matchesLoosely(required, present))
+  );
+
+  return {
+    hasRule: true,
+    comparable: true,
+    matched,
+    contradiction: !matched,
+  };
+};
+
+const firstNonEmptyValue = (source = {}, aliases = []) => {
+  if (!source || typeof source !== "object") return "";
+  for (const key of aliases) {
+    const normalizedAlias = normalizeFieldKey(key);
+    const entry = Object.entries(source).find(
+      ([sourceKey]) => normalizeFieldKey(sourceKey) === normalizedAlias
+    );
+    if (!entry) continue;
+    const value = entry[1];
+    const text = toComparableTextValue(value);
+    if (text) return text;
+  }
+  return "";
+};
+
+const collectDocumentProfileHints = (documents = []) => {
+  const hints = {};
+
+  const applySource = (source = {}) => {
+    Object.entries(DOCUMENT_HINT_FIELD_ALIASES).forEach(([profileKey, aliases]) => {
+      if (hints[profileKey]) return;
+      const value = firstNonEmptyValue(source, [profileKey, ...aliases]);
+      if (!value) return;
+      hints[profileKey] = value;
+    });
+  };
+
+  (Array.isArray(documents) ? documents : []).forEach((doc) => {
+    if (doc?.autofill_fields && typeof doc.autofill_fields === "object") {
+      applySource(doc.autofill_fields);
+    }
+    if (doc?.extracted_data && typeof doc.extracted_data === "object") {
+      applySource(doc.extracted_data);
+    }
+  });
+
+  return hints;
+};
+
+const mergeProfileWithDocumentHints = (profile = {}, hints = {}) => {
+  const merged = {
+    ...(profile && typeof profile === "object" ? profile : {}),
+    location:
+      profile?.location && typeof profile.location === "object"
+        ? { ...profile.location }
+        : {},
+  };
+  const appliedHintKeys = [];
+
+  const addHint = (targetKey, value) => {
+    if (!value) return;
+    const current = toComparableTextValue(merged[targetKey]);
+    if (current) return;
+    merged[targetKey] = value;
+    appliedHintKeys.push(targetKey);
+  };
+
+  addHint("occupation", hints.occupation);
+  addHint("category", hints.category);
+  addHint("gender", hints.gender);
+
+  const parsedAge = parseNumber(hints.age);
+  if (parseNumber(merged.age) === null && parsedAge !== null) {
+    merged.age = parsedAge;
+    appliedHintKeys.push("age");
+  }
+
+  const parsedIncome = parseNumber(hints.annual_income);
+  if (parseNumber(merged.annual_income ?? merged.income) === null && parsedIncome !== null) {
+    merged.annual_income = parsedIncome;
+    appliedHintKeys.push("annual_income");
+  }
+
+  const currentState = getProfileState(merged);
+  if (!currentState && hints.state) {
+    merged.location = {
+      ...(merged.location || {}),
+      state: hints.state,
+    };
+    appliedHintKeys.push("state");
+  }
+
+  return {
+    mergedProfile: merged,
+    appliedHintKeys: unique(appliedHintKeys),
+  };
+};
+
+const buildProfileSignature = (profile = {}) => {
+  const age = parseNumber(profile?.age);
+  const annualIncome = parseNumber(profile?.annual_income ?? profile?.income);
+  return [
+    `age:${age === null ? "" : String(age)}`,
+    `occupation:${normalize(profile?.occupation)}`,
+    `category:${normalize(profile?.category)}`,
+    `income:${annualIncome === null ? "" : String(annualIncome)}`,
+    `gender:${normalizeGenderValue(profile?.gender)}`,
+    `state:${getProfileState(profile)}`,
+  ].join("|");
+};
+
 const deriveOccupationGroupKeywords = (occupation) => {
   const occ = normalize(occupation);
   if (!occ) return [];
@@ -74,7 +350,7 @@ const buildSearchKeywords = (profile) => {
   const occKeywords = deriveOccupationGroupKeywords(profile.occupation);
   const category = normalize(profile.category);
   const gender = normalize(profile.gender);
-  const state = normalize(profile.location?.state);
+  const state = getProfileState(profile);
 
   const keywords = new Set([...occKeywords]);
   if (category) keywords.add(category);
@@ -284,10 +560,11 @@ const normalizeMatchedConditions = (matchedConditions) => ({
 const calculateScoreFromMatchedConditions = (matchedConditions) => {
   const matched = normalizeMatchedConditions(matchedConditions);
   let score = 0;
-  if (matched.occupation) score += OCCUPATION_WEIGHT;
-  if (matched.eligibility_rule) score += ELIGIBILITY_WEIGHT;
-  if (matched.state) score += STATE_WEIGHT;
-  if (matched.category) score += CATEGORY_WEIGHT;
+  Object.entries(SCORE_WEIGHTS).forEach(([key, weight]) => {
+    if (matched[key]) {
+      score += Number(weight || 0);
+    }
+  });
   return { matched, score };
 };
 
@@ -328,11 +605,19 @@ const evaluateSchemeDeterministic = (scheme, profile, profileKeywords) => {
   const userIncome = parseNumber(profile.annual_income ?? profile.income);
   const userGender = normalize(profile.gender);
   const userCategory = normalize(profile.category);
-  const userState = normalize(profile.location?.state);
+  const userState = getProfileState(profile);
   const userOccupationKeywords = profileKeywords.occupationKeywords;
   const userOccupationRaw = normalize(profile.occupation);
+  const directOccupationResult = evaluateDirectOccupationMatch({
+    schemeOccupation: scheme.occupation,
+    userOccupationRaw,
+    userOccupationKeywords,
+  });
+  const directStateResult = evaluateDirectTextRuleMatch(scheme.state, userState);
+  const directCategoryResult = evaluateDirectCategoryMatch(scheme.category, userCategory);
+  const directGenderResult = evaluateDirectGenderMatch(scheme.gender, userGender);
 
-  const occupationComparable = occupationRule.hasRule && !!userOccupationRaw;
+  let occupationComparable = occupationRule.hasRule && !!userOccupationRaw;
   const occupationMatchedByKeyword = countKeywordHits(searchableText, userOccupationKeywords) > 0;
   let occupationMatched = false;
   let occupationContradiction = false;
@@ -359,6 +644,10 @@ const evaluateSchemeDeterministic = (scheme, profile, profileKeywords) => {
   } else {
     occupationMatched = occupationMatchedByKeyword;
   }
+  const occupationRuleRequired = occupationRule.hasRule || directOccupationResult.hasRule;
+  occupationComparable = occupationComparable || directOccupationResult.comparable;
+  occupationMatched = occupationMatched || directOccupationResult.matched;
+  occupationContradiction = occupationContradiction || directOccupationResult.contradiction;
 
   const ageResult = evaluateRuleMatch({
     hasRule: ageRule.hasRule,
@@ -391,39 +680,55 @@ const evaluateSchemeDeterministic = (scheme, profile, profileKeywords) => {
     matcher: (category) => categoryRule.required.some((required) => category.includes(normalize(required))),
   });
 
+  const stateRuleRequired = stateRule.hasRule || directStateResult.hasRule;
+  const categoryRuleRequired = categoryRule.hasRule || directCategoryResult.hasRule;
+  const genderRuleRequired = genderRule.hasRule || directGenderResult.hasRule;
+
+  const stateComparable = stateResult.comparable || directStateResult.comparable;
+  const categoryComparable = categoryResult.comparable || directCategoryResult.comparable;
+  const genderComparable = genderResult.comparable || directGenderResult.comparable;
+
+  const stateMatched = stateResult.matched || directStateResult.matched;
+  const categoryMatched = categoryResult.matched || directCategoryResult.matched;
+  const genderMatched = genderResult.matched || directGenderResult.matched;
+
+  const stateContradiction = stateResult.contradiction || directStateResult.contradiction;
+  const categoryContradiction = categoryResult.contradiction || directCategoryResult.contradiction;
+  const genderContradiction = genderResult.contradiction || directGenderResult.contradiction;
+
   const hasComparableEligibilityRule =
     occupationComparable ||
     ageResult.comparable ||
     incomeResult.comparable ||
-    genderResult.comparable ||
-    stateResult.comparable ||
-    categoryResult.comparable;
+    genderComparable ||
+    stateComparable ||
+    categoryComparable;
 
   const eligibilityRuleMatched =
     hasComparableEligibilityRule &&
     !occupationContradiction &&
-    (!occupationRule.hasRule || !occupationComparable || occupationMatched) &&
+    (!occupationRuleRequired || !occupationComparable || occupationMatched) &&
     (!ageRule.hasRule || ageResult.matched) &&
     (!incomeRule.hasRule || incomeResult.matched) &&
-    (!genderRule.hasRule || genderResult.matched) &&
-    (!stateRule.hasRule || stateResult.matched) &&
-    (!categoryRule.hasRule || categoryResult.matched);
+    (!genderRuleRequired || genderMatched) &&
+    (!stateRuleRequired || stateMatched) &&
+    (!categoryRuleRequired || categoryMatched);
 
   const clearlyContradicts =
     occupationContradiction ||
     ageResult.contradiction ||
     incomeResult.contradiction ||
-    genderResult.contradiction ||
-    stateResult.contradiction ||
-    categoryResult.contradiction;
+    genderContradiction ||
+    stateContradiction ||
+    categoryContradiction;
 
   const { matched, score } = calculateScoreFromMatchedConditions({
     occupation: occupationMatched,
     age: ageResult.matched,
     income: incomeResult.matched,
-    gender: genderResult.matched,
-    state: stateResult.matched,
-    category: categoryResult.matched,
+    gender: genderMatched,
+    state: stateMatched,
+    category: categoryMatched,
     eligibility_rule: eligibilityRuleMatched,
   });
   const schemeLink = resolveSchemePageLink(
@@ -602,6 +907,54 @@ const buildRecommendations = async ({
   return toPublicRecommendations(top);
 };
 
+const buildEffectiveRecommendationProfile = async ({
+  userId,
+  profileFromDb = {},
+  profileOverrides = {},
+}) => {
+  let documentRecords = [];
+  try {
+    documentRecords = await UserDocument.find({ user_id: userId })
+      .sort({ uploaded_at: -1 })
+      .lean();
+  } catch {
+    documentRecords = [];
+  }
+
+  const documentHints = collectDocumentProfileHints(documentRecords);
+  const { mergedProfile, appliedHintKeys } = mergeProfileWithDocumentHints(
+    profileFromDb,
+    documentHints
+  );
+
+  const effectiveProfile = {
+    ...(mergedProfile || {}),
+  };
+
+  if (profileOverrides && typeof profileOverrides === "object") {
+    Object.entries(profileOverrides).forEach(([key, value]) => {
+      const text = toComparableTextValue(value);
+      if (!text) return;
+      effectiveProfile[key] = text;
+    });
+  }
+
+  if (toComparableTextValue(profileOverrides?.state)) {
+    effectiveProfile.location = {
+      ...(effectiveProfile.location && typeof effectiveProfile.location === "object"
+        ? effectiveProfile.location
+        : {}),
+      state: toComparableTextValue(profileOverrides.state),
+    };
+  }
+
+  return {
+    effectiveProfile,
+    documentHintKeys: appliedHintKeys,
+    documentsConsidered: documentRecords.length,
+  };
+};
+
 export const recommendSchemes = async (req, res) => {
   try {
     const userId = req.user?.id;
@@ -620,20 +973,35 @@ export const recommendSchemes = async (req, res) => {
       });
     }
 
+    const {
+      effectiveProfile,
+      documentHintKeys,
+      documentsConsidered,
+    } = await buildEffectiveRecommendationProfile({
+      userId,
+      profileFromDb: profile,
+    });
     const schemes = await Scheme.collection.find({}).toArray();
-    const profileKeywords = buildSearchKeywords(profile);
+    const profileKeywords = buildSearchKeywords(effectiveProfile);
     const recommendations = await buildRecommendations({
-      profile,
+      profile: effectiveProfile,
       schemes,
       profileKeywords,
       requireKeywordMatch: false,
     });
+    const profileSignature = buildProfileSignature(effectiveProfile);
 
     return res.status(200).json({
       success: true,
       total_recommendations: recommendations.length,
       best_match: recommendations[0] || null,
       recommendations,
+      profile_signature: profileSignature,
+      recommendation_engine_version: RECOMMENDATION_ENGINE_VERSION,
+      profile_context_source:
+        documentHintKeys.length > 0 ? "profile_plus_document_hints" : "profile_only",
+      document_hint_keys: documentHintKeys,
+      documents_considered: documentsConsidered,
     });
   } catch (error) {
     return res.status(500).json({
@@ -665,12 +1033,21 @@ export const searchSchemes = async (req, res) => {
     const query = String(req.body?.query || "").trim();
     const occupation = String(req.body?.occupation || "").trim();
     const gender = String(req.body?.gender || "").trim();
+    const state = String(req.body?.state || "").trim();
 
-    const effectiveProfile = {
-      ...profile,
-      occupation: occupation || profile.occupation,
-      gender: gender || profile.gender,
-    };
+    const {
+      effectiveProfile,
+      documentHintKeys,
+      documentsConsidered,
+    } = await buildEffectiveRecommendationProfile({
+      userId,
+      profileFromDb: profile,
+      profileOverrides: {
+        occupation: occupation || profile.occupation,
+        gender: gender || profile.gender,
+        state,
+      },
+    });
 
     const schemes = await Scheme.collection.find({}).toArray();
     const profileKeywords = buildSearchKeywordsWithQuery(
@@ -692,6 +1069,12 @@ export const searchSchemes = async (req, res) => {
       total_recommendations: recommendations.length,
       best_match: recommendations[0] || null,
       recommendations,
+      profile_signature: buildProfileSignature(effectiveProfile),
+      recommendation_engine_version: RECOMMENDATION_ENGINE_VERSION,
+      profile_context_source:
+        documentHintKeys.length > 0 ? "profile_plus_document_hints" : "profile_only",
+      document_hint_keys: documentHintKeys,
+      documents_considered: documentsConsidered,
     });
   } catch (error) {
     return res.status(500).json({
